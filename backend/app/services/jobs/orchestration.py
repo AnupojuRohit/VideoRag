@@ -215,7 +215,10 @@ async def retry_job(
             asset = await session.get(VideoAsset, job.video_id)
             if asset is None:
                 raise APIError(404, "video_not_found", "The video asset was not found.")
-            if not asset.external_processing_consent:
+            if (
+                not asset.external_processing_consent
+                or asset.external_processing_consent_version != CONSENT_VERSION
+            ):
                 raise APIError(
                     409,
                     "external_processing_consent_required",

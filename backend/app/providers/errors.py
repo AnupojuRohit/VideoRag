@@ -1,7 +1,7 @@
 from datetime import datetime
 
 
-class TranscriptionProviderError(Exception):
+class ProviderError(Exception):
     def __init__(
         self,
         code: str,
@@ -25,3 +25,15 @@ class TranscriptionProviderError(Exception):
         self.quota = quota
         self.latency_ms = latency_ms
         self.request_id = request_id
+
+
+class TranscriptionProviderError(ProviderError):
+    pass
+
+
+class VisionProviderError(ProviderError):
+    pass
+
+
+class EmbeddingProviderError(ProviderError):
+    pass

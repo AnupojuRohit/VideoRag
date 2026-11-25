@@ -16,22 +16,28 @@ from sqlalchemy import select, text
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.core.config import get_settings
+from app.core.privacy import EXTERNAL_PROCESSING_CONSENT_VERSION
 from app.db.session import SessionLocal, engine
-from app.models.enums import LifecycleStatus, StageStatus
+from app.models.enums import LifecycleStatus, StageStatus, PIPELINE_STAGES
 from app.models.processing_job import ProcessingJob
 from app.models.processing_stage import ProcessingStage
 from app.models.provider_usage_event import ProviderUsageEvent
 from app.models.video_asset import VideoAsset
-from app.providers.errors import TranscriptionProviderError
+from app.providers.errors import ProviderError, TranscriptionProviderError
 from app.providers.gemini_transcription import (
-    MODEL_ID,
+    MODEL_ID as TRANSCRIPTION_MODEL_ID,
     create_transcription_provider,
+)
+from app.providers.gemini_vision import (
+    MODEL_ID as VISION_MODEL_ID,
+    create_vision_provider,
 )
 from app.providers.transcription import (
     ProviderUsage,
     TranscribedWord,
     TranscriptionProvider,
 )
+from app.providers.vision import VisionProvider
 from app.services.jobs.orchestration import (
     mark_job_failed,
     pause_job_for_quota,
@@ -44,15 +50,17 @@ from app.services.media.audio import (
     extract_audio_track,
     inspect_audio_duration,
 )
+from app.services.media.scene_detection import DetectedScene, detect_scenes
+from app.services.media.video_frames import (
+    SelectedFrame,
+    extract_selected_frames,
+    near_duplicate_frames,
+    select_frame_timestamps,
+)
+from app.services.visual.ocr import extract_visible_text
 
 logger = logging.getLogger(__name__)
-_STAGE_NAMES = (
-    "media_preparation",
-    "audio_extraction",
-    "audio_segmentation",
-    "transcription",
-    "transcript_chunking",
-)
+_STAGE_NAMES = PIPELINE_STAGES
 _WORD_CHUNK_LIMIT = 1000
 _PAUSE_CHUNK_SECONDS = 2.5
 _WORD_SPACE_PUNCTUATION = re.compile(r"^[,.;:!?%)\]}]+$")
@@ -139,7 +147,11 @@ async def _claim_job(job_id: UUID) -> JobContext | None:
                     "The video asset for this job no longer exists.",
                     retryable=False,
                 )
-            if not asset.external_processing_consent:
+            if (
+                not asset.external_processing_consent
+                or asset.external_processing_consent_version
+                != EXTERNAL_PROCESSING_CONSENT_VERSION
+            ):
                 raise TranscriptionProviderError(
                     "external_processing_consent_required",
                     "Accept the external AI processing terms before this job can run.",
@@ -388,17 +400,17 @@ async def _finish_pipeline_at_phase_boundary(job_id: UUID) -> None:
 
 
 async def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
-    await asyncio.to_thread(path.parent.mkdir, parents=True, exist_ok=True)
     temporary_path = path.with_suffix(path.suffix + ".tmp")
     try:
+        await asyncio.to_thread(path.parent.mkdir, parents=True, exist_ok=True)
         async with aiofiles.open(temporary_path, "w", encoding="utf-8") as file:
             await file.write(json.dumps(payload, ensure_ascii=False))
             await file.flush()
         await asyncio.to_thread(temporary_path.replace, path)
     except OSError as exc:
         raise MediaProcessingError(
-            "local_transcript_write_failed",
-            "The local transcript artifact could not be saved.",
+            "local_artifact_write_failed",
+            "A local processing artifact could not be saved.",
             retryable=True,
             transient=True,
         ) from exc
@@ -437,6 +449,8 @@ async def _persist_usage(job_id: UUID, stage_name: str, usage: ProviderUsage) ->
                     status_code=usage.status_code,
                     latency_ms=usage.latency_ms,
                     input_bytes=usage.input_bytes,
+                    input_tokens=usage.input_tokens,
+                    output_tokens=usage.output_tokens,
                     request_id=usage.request_id,
                     error_code=usage.cleanup_error,
                 )
@@ -446,11 +460,14 @@ async def _persist_usage(job_id: UUID, stage_name: str, usage: ProviderUsage) ->
 async def _persist_provider_error(
     job_id: UUID,
     stage_name: str,
-    segment_path: Path,
-    error: TranscriptionProviderError,
+    source_path: Path,
+    error: ProviderError,
+    *,
+    model_id: str,
+    operation: str,
 ) -> None:
     try:
-        input_bytes = segment_path.stat().st_size
+        input_bytes = source_path.stat().st_size
     except OSError:
         input_bytes = None
     async with SessionLocal() as session:
@@ -460,8 +477,8 @@ async def _persist_provider_error(
                     job_id=job_id,
                     stage_name=stage_name,
                     provider="gemini",
-                    model_id=MODEL_ID,
-                    operation="transcription",
+                    model_id=model_id,
+                    operation=operation,
                     status_code=error.status_code,
                     latency_ms=error.latency_ms or 0,
                     input_bytes=input_bytes,
@@ -642,6 +659,8 @@ async def _transcribe_segments(context: JobContext) -> None:
                 "transcription",
                 segment.path,
                 exc,
+                model_id=TRANSCRIPTION_MODEL_ID,
+                operation="transcription",
             )
             raise
         if await _is_cancelled(context.job_id):
@@ -844,6 +863,434 @@ async def _chunk_transcript(context: JobContext) -> dict[str, Any]:
     }
 
 
+def _scene_values(checkpoint: dict[str, Any], duration_seconds: float) -> list[DetectedScene]:
+    values = checkpoint.get("scenes")
+    if not isinstance(values, list):
+        raise MediaProcessingError(
+            "scene_checkpoint_invalid",
+            "The saved scene detection checkpoint is invalid.",
+            retryable=False,
+        )
+    scenes: list[DetectedScene] = []
+    for value in values:
+        if not isinstance(value, dict):
+            raise MediaProcessingError(
+                "scene_checkpoint_invalid",
+                "The saved scene detection checkpoint is invalid.",
+                retryable=False,
+            )
+        try:
+            start = float(value["start_seconds"])
+            end = float(value["end_seconds"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise MediaProcessingError(
+                "scene_checkpoint_invalid",
+                "The saved scene detection checkpoint is invalid.",
+                retryable=False,
+            ) from exc
+        if (
+            not math.isfinite(start + end)
+            or start < 0
+            or end <= start
+            or end > duration_seconds
+        ):
+            raise MediaProcessingError(
+                "scene_checkpoint_invalid",
+                "The saved scene detection checkpoint has invalid timestamps.",
+                retryable=False,
+            )
+        scenes.append(DetectedScene(start_seconds=start, end_seconds=end))
+    return scenes
+
+
+async def _run_scene_detection(context: JobContext) -> dict[str, Any]:
+    settings = get_settings()
+    scenes = await detect_scenes(
+        context.original_path,
+        settings.scene_threshold,
+        settings.scene_detection_timeout_seconds,
+    )
+    return {
+        "scenes": [
+            {
+                "start_seconds": scene.start_seconds,
+                "end_seconds": scene.end_seconds,
+            }
+            for scene in scenes
+        ]
+    }
+
+
+async def _run_frame_extraction(context: JobContext) -> dict[str, Any]:
+    settings = get_settings()
+    scene_checkpoint = await _stage_checkpoint(context.job_id, "scene_detection")
+    scenes = _scene_values(scene_checkpoint, context.duration_seconds)
+    timestamps = select_frame_timestamps(
+        scenes,
+        context.duration_seconds,
+        settings.frame_sampling_interval_seconds,
+        settings.frame_min_spacing_seconds,
+        settings.max_frames_per_video,
+    )
+    frames = await extract_selected_frames(
+        context.original_path,
+        timestamps,
+        context.work_dir / "visual" / "frames",
+        ffmpeg_path=settings.ffmpeg_path,
+        timeout_seconds=settings.frame_extraction_timeout_seconds,
+        max_dimension=settings.frame_max_dimension,
+    )
+    return {
+        "frames": [
+            {
+                "index": frame.index,
+                "timestamp_seconds": frame.timestamp_seconds,
+            }
+            for frame in frames
+        ]
+    }
+
+
+def _frame_manifest(
+    context: JobContext,
+    checkpoint: dict[str, Any],
+) -> list[SelectedFrame]:
+    values = checkpoint.get("frames")
+    if not isinstance(values, list):
+        raise MediaProcessingError(
+            "frame_checkpoint_invalid",
+            "The saved frame extraction checkpoint is invalid.",
+            retryable=False,
+        )
+    frames: list[SelectedFrame] = []
+    seen: set[int] = set()
+    frames_dir = context.work_dir / "visual" / "frames"
+    for value in values:
+        if not isinstance(value, dict):
+            raise MediaProcessingError(
+                "frame_checkpoint_invalid",
+                "The saved frame extraction checkpoint is invalid.",
+                retryable=False,
+            )
+        try:
+            index = int(value["index"])
+            timestamp = float(value["timestamp_seconds"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise MediaProcessingError(
+                "frame_checkpoint_invalid",
+                "The saved frame extraction checkpoint is invalid.",
+                retryable=False,
+            ) from exc
+        if (
+            index < 0
+            or index in seen
+            or not math.isfinite(timestamp)
+            or timestamp < 0
+            or timestamp >= context.duration_seconds
+        ):
+            raise MediaProcessingError(
+                "frame_checkpoint_invalid",
+                "The saved frame extraction checkpoint has invalid values.",
+                retryable=False,
+            )
+        path = frames_dir / f"frame-{index:05d}.jpg"
+        if not path.is_file():
+            raise MediaProcessingError(
+                "frame_checkpoint_incomplete",
+                "A selected frame is missing from local storage.",
+                retryable=True,
+                transient=True,
+            )
+        seen.add(index)
+        frames.append(
+            SelectedFrame(
+                index=index,
+                timestamp_seconds=timestamp,
+                path=path,
+            )
+        )
+    return frames
+
+
+async def _frame_ocr_artifact(context: JobContext, index: int) -> dict[str, Any] | None:
+    path = context.work_dir / "visual" / "ocr" / f"frame-{index:05d}.json"
+    if not path.is_file():
+        return None
+    try:
+        artifact = await _read_json(path)
+    except MediaProcessingError:
+        return None
+    if artifact.get("frame_index") != index or not isinstance(
+        artifact.get("text"), str
+    ):
+        return None
+    return artifact
+
+
+async def _run_ocr(context: JobContext) -> dict[str, Any]:
+    frame_checkpoint = await _stage_checkpoint(context.job_id, "frame_extraction")
+    frames = _frame_manifest(context, frame_checkpoint)
+    checkpoint = await _stage_checkpoint(context.job_id, "ocr")
+    completed_values = checkpoint.get("completed_frames", [])
+    if not isinstance(completed_values, list):
+        raise MediaProcessingError(
+            "ocr_checkpoint_invalid",
+            "The saved OCR checkpoint is invalid.",
+            retryable=False,
+        )
+    completed = {
+        value for value in completed_values if isinstance(value, int) and value >= 0
+    }
+    for frame in frames:
+        if await _is_cancelled(context.job_id):
+            return {"completed_frames": sorted(completed)}
+        artifact = await _frame_ocr_artifact(context, frame.index)
+        if frame.index in completed and artifact is not None:
+            continue
+        text_value = await asyncio.to_thread(extract_visible_text, frame.path)
+        await _write_json_atomic(
+            context.work_dir
+            / "visual"
+            / "ocr"
+            / f"frame-{frame.index:05d}.json",
+            {"frame_index": frame.index, "text": text_value},
+        )
+        completed.add(frame.index)
+        checkpoint = {"completed_frames": sorted(completed)}
+        await _save_stage_checkpoint(context.job_id, "ocr", checkpoint)
+    return {"completed_frames": sorted(completed)}
+
+
+async def _run_visual_analysis(context: JobContext) -> dict[str, Any]:
+    frame_checkpoint = await _stage_checkpoint(context.job_id, "frame_extraction")
+    frames = _frame_manifest(context, frame_checkpoint)
+    frame_values: list[dict[str, object]] = []
+    for frame in frames:
+        artifact = await _frame_ocr_artifact(context, frame.index)
+        if artifact is None:
+            raise MediaProcessingError(
+                "ocr_artifact_missing",
+                "Text recognition data for a selected frame is missing.",
+                retryable=True,
+                transient=True,
+            )
+        frame_values.append(
+            {
+                "frame_id": str(frame.index),
+                "frame_path": str(frame.path),
+                "ocr_text": artifact["text"],
+                "timestamp_seconds": frame.timestamp_seconds,
+            }
+        )
+
+    settings = get_settings()
+    retained, duplicates = near_duplicate_frames(
+        frame_values,
+        settings.perceptual_hash_distance,
+    )
+    checkpoint = await _stage_checkpoint(context.job_id, "visual_analysis")
+    completed_values = checkpoint.get("completed_frames", [])
+    if not isinstance(completed_values, list):
+        raise MediaProcessingError(
+            "visual_checkpoint_invalid",
+            "The saved visual analysis checkpoint is invalid.",
+            retryable=False,
+        )
+    completed = {
+        value for value in completed_values if isinstance(value, int) and value >= 0
+    }
+    provider: VisionProvider | None = None
+    evidence: list[dict[str, Any]] = []
+    for frame in retained:
+        frame_index = int(str(frame["frame_id"]))
+        timestamp = float(frame["timestamp_seconds"])
+        frame_path = Path(str(frame["frame_path"]))
+        ocr_text = str(frame["ocr_text"])
+        artifact_path = (
+            context.work_dir
+            / "visual"
+            / "descriptions"
+            / f"frame-{frame_index:05d}.json"
+        )
+        artifact: dict[str, Any] | None = None
+        if artifact_path.is_file():
+            try:
+                cached = await _read_json(artifact_path)
+            except MediaProcessingError:
+                cached = {}
+            if (
+                cached.get("frame_index") == frame_index
+                and cached.get("timestamp_seconds") == timestamp
+                and cached.get("ocr_text") == ocr_text
+                and isinstance(cached.get("description"), str)
+            ):
+                artifact = cached
+        if artifact is None:
+            if await _is_cancelled(context.job_id):
+                return {"completed_frames": sorted(completed)}
+            if provider is None:
+                provider = create_vision_provider()
+            try:
+                result = await provider.describe_frame(frame_path, ocr_text)
+            except ProviderError as exc:
+                await _persist_provider_error(
+                    context.job_id,
+                    "visual_analysis",
+                    frame_path,
+                    exc,
+                    model_id=VISION_MODEL_ID,
+                    operation="vision",
+                )
+                raise
+            await _persist_usage(context.job_id, "visual_analysis", result.usage)
+            artifact = {
+                "frame_index": frame_index,
+                "timestamp_seconds": timestamp,
+                "frame_path": str(frame_path),
+                "ocr_text": ocr_text,
+                "description": result.description,
+            }
+            await _write_json_atomic(artifact_path, artifact)
+        completed.add(frame_index)
+        await _save_stage_checkpoint(
+            context.job_id,
+            "visual_analysis",
+            {"completed_frames": sorted(completed)},
+        )
+        description = str(artifact["description"])
+        searchable_content = description
+        if ocr_text:
+            searchable_content = f"{description}\nVisible text: {ocr_text}"
+        evidence.append(
+            {
+                "source_ref": f"visual:frame:{frame_index:05d}",
+                "content": searchable_content,
+                "start_time": timestamp,
+                "end_time": timestamp,
+                "metadata": {
+                    "frame_index": frame_index,
+                    "frame_path": str(frame_path),
+                    "ocr_text": ocr_text,
+                    "visual_description": description,
+                    "duplicate_of": None,
+                },
+            }
+        )
+
+    for duplicate_index, source_index in duplicates.items():
+        logger.debug(
+            "Near-duplicate video frame omitted",
+            extra={
+                "video_id": str(context.video_id),
+                "frame_index": duplicate_index,
+                "retained_frame_index": source_index,
+            },
+        )
+    output_path = context.work_dir / "visual" / "visual-evidence.json"
+    await _write_json_atomic(
+        output_path,
+        {
+            "video_id": str(context.video_id),
+            "timeline": "original_video",
+            "sampling_policy": {
+                "version": "scene-centers-plus-configured-interval-v1",
+                "interval_seconds": settings.frame_sampling_interval_seconds,
+                "minimum_spacing_seconds": settings.frame_min_spacing_seconds,
+                "maximum_frames": settings.max_frames_per_video,
+                "maximum_dimension": settings.frame_max_dimension,
+                "perceptual_hash_distance": settings.perceptual_hash_distance,
+            },
+            "duplicate_count": len(duplicates),
+            "evidence": evidence,
+        },
+    )
+    return {
+        "output_path": str(output_path),
+        "evidence_count": len(evidence),
+        "duplicate_count": len(duplicates),
+        "completed_frames": sorted(completed),
+    }
+
+
+async def _run_visual_branch(context: JobContext) -> None:
+    scene_checkpoint = await _stage_checkpoint(context.job_id, "scene_detection")
+    try:
+        _scene_values(scene_checkpoint, context.duration_seconds)
+    except MediaProcessingError:
+        await _reset_stage(context.job_id, "scene_detection")
+        await _reset_stage(context.job_id, "frame_extraction")
+        await _reset_stage(context.job_id, "ocr")
+        await _reset_stage(context.job_id, "visual_analysis")
+
+    await _run_branch_stage(
+        context,
+        "scene_detection",
+        lambda: _run_scene_detection(context),
+    )
+    if await _is_cancelled(context.job_id):
+        return
+    frame_checkpoint = await _stage_checkpoint(context.job_id, "frame_extraction")
+    try:
+        _frame_manifest(context, frame_checkpoint)
+    except MediaProcessingError:
+        await _reset_stage(context.job_id, "frame_extraction")
+        await _reset_stage(context.job_id, "ocr")
+        await _reset_stage(context.job_id, "visual_analysis")
+
+    await _run_branch_stage(
+        context,
+        "frame_extraction",
+        lambda: _run_frame_extraction(context),
+    )
+    if await _is_cancelled(context.job_id):
+        return
+    frame_checkpoint = await _stage_checkpoint(context.job_id, "frame_extraction")
+    try:
+        frames = _frame_manifest(context, frame_checkpoint)
+    except MediaProcessingError as error:
+        raise BranchProcessingError("frame_extraction", error) from error
+    ocr_checkpoint = await _stage_checkpoint(context.job_id, "ocr")
+    completed_ocr = ocr_checkpoint.get("completed_frames", [])
+    if (
+        not isinstance(completed_ocr, list)
+        or {
+            value for value in completed_ocr if isinstance(value, int)
+        }
+        != {frame.index for frame in frames}
+        or any(
+            not (
+                context.work_dir
+                / "visual"
+                / "ocr"
+                / f"frame-{frame.index:05d}.json"
+            ).is_file()
+            for frame in frames
+        )
+    ):
+        await _reset_stage(context.job_id, "ocr")
+        await _reset_stage(context.job_id, "visual_analysis")
+    await _run_branch_stage(context, "ocr", lambda: _run_ocr(context))
+    if await _is_cancelled(context.job_id):
+        return
+    analysis_checkpoint = await _stage_checkpoint(
+        context.job_id,
+        "visual_analysis",
+    )
+    output_path = analysis_checkpoint.get("output_path")
+    expected_output = context.work_dir / "visual" / "visual-evidence.json"
+    if (
+        not isinstance(output_path, str)
+        or Path(output_path) != expected_output
+        or not expected_output.is_file()
+    ):
+        await _reset_stage(context.job_id, "visual_analysis")
+    await _run_branch_stage(
+        context,
+        "visual_analysis",
+        lambda: _run_visual_analysis(context),
+    )
+
+
 async def _run_stage(
     context: JobContext,
     stage_name: str,
@@ -853,6 +1300,158 @@ async def _run_stage(
         return False
     checkpoint = await operation()
     return await _complete_stage(context.job_id, stage_name, checkpoint)
+
+
+class BranchProcessingError(Exception):
+    def __init__(
+        self,
+        stage_name: str,
+        error: ProviderError | MediaProcessingError,
+    ) -> None:
+        super().__init__(error.user_message)
+        self.stage_name = stage_name
+        self.error = error
+
+
+async def _run_branch_stage(
+    context: JobContext,
+    stage_name: str,
+    operation: Callable[[], Awaitable[dict[str, Any]]],
+) -> bool:
+    try:
+        return await _run_stage(context, stage_name, operation)
+    except (ProviderError, MediaProcessingError) as error:
+        raise BranchProcessingError(stage_name, error) from error
+
+
+async def _skip_stage(job_id: UUID, stage_name: str) -> None:
+    now = datetime.now(timezone.utc)
+    async with SessionLocal() as session:
+        async with session.begin():
+            stage = await session.scalar(
+                select(ProcessingStage)
+                .where(
+                    ProcessingStage.job_id == job_id,
+                    ProcessingStage.name == stage_name,
+                )
+                .with_for_update()
+            )
+            if stage is not None and stage.status == StageStatus.PENDING:
+                stage.status = StageStatus.SKIPPED
+                stage.finished_at = now
+
+
+async def _run_audio_branch(context: JobContext) -> None:
+    audio_stages = (
+        "audio_extraction",
+        "audio_segmentation",
+        "transcription",
+        "transcript_chunking",
+    )
+    if not context.has_audio:
+        for stage_name in audio_stages:
+            await _skip_stage(context.job_id, stage_name)
+        return
+
+    audio_path = context.work_dir / "audio" / "audio.flac"
+    if not audio_path.is_file():
+        await _reset_stage(context.job_id, "audio_extraction")
+
+    async def extract() -> dict[str, Any]:
+        path, duration = await _prepare_audio(context)
+        return {"audio_path": str(path), "duration_seconds": duration}
+
+    await _run_branch_stage(context, "audio_extraction", extract)
+    if await _is_cancelled(context.job_id):
+        return
+    checkpoint = await _stage_checkpoint(context.job_id, "audio_extraction")
+    try:
+        audio_path = Path(checkpoint["audio_path"])
+        audio_duration = float(checkpoint["duration_seconds"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise BranchProcessingError(
+            "audio_extraction",
+            MediaProcessingError(
+                "audio_checkpoint_invalid",
+                "The saved audio extraction checkpoint is invalid.",
+                retryable=False,
+            ),
+        ) from exc
+    if (
+        not audio_path.is_file()
+        or not math.isfinite(audio_duration)
+        or audio_duration <= 0
+    ):
+        raise BranchProcessingError(
+            "audio_extraction",
+            MediaProcessingError(
+                "audio_checkpoint_invalid",
+                "The extracted audio file or its duration is invalid.",
+                retryable=False,
+            ),
+        )
+
+    segment_checkpoint = await _stage_checkpoint(
+        context.job_id,
+        "audio_segmentation",
+    )
+    saved_segments = segment_checkpoint.get("segments", [])
+    if not isinstance(saved_segments, list) or not saved_segments or any(
+        not _segment_artifact_exists(context, item, "flac")
+        for item in saved_segments
+    ):
+        await _reset_stage(context.job_id, "audio_segmentation")
+
+    async def segment() -> dict[str, Any]:
+        segments = await _create_audio_segments(
+            context,
+            audio_path,
+            audio_duration,
+        )
+        return {
+            "segments": [
+                {
+                    "index": item.index,
+                    "path": str(item.path),
+                    "start_seconds": item.start_seconds,
+                    "duration_seconds": item.duration_seconds,
+                }
+                for item in segments
+            ]
+        }
+
+    await _run_branch_stage(context, "audio_segmentation", segment)
+    if await _is_cancelled(context.job_id):
+        return
+
+    segmentation_checkpoint = await _stage_checkpoint(
+        context.job_id,
+        "audio_segmentation",
+    )
+    raw_segments = segmentation_checkpoint.get("segments", [])
+    if not isinstance(raw_segments, list) or any(
+        not _segment_artifact_exists(context, item, "transcript.json")
+        for item in raw_segments
+    ):
+        await _reset_stage(context.job_id, "transcription")
+
+    async def transcribe() -> dict[str, Any]:
+        await _transcribe_segments(context)
+        return await _stage_checkpoint(context.job_id, "transcription")
+
+    await _run_branch_stage(context, "transcription", transcribe)
+    if await _is_cancelled(context.job_id):
+        return
+
+    chunk_checkpoint = await _stage_checkpoint(context.job_id, "transcript_chunking")
+    chunk_path = chunk_checkpoint.get("output_path")
+    if not isinstance(chunk_path, str) or not Path(chunk_path).is_file():
+        await _reset_stage(context.job_id, "transcript_chunking")
+    await _run_branch_stage(
+        context,
+        "transcript_chunking",
+        lambda: _chunk_transcript(context),
+    )
 
 
 async def _requeue_transient_failure(
@@ -912,11 +1511,11 @@ def _retry_delay(retry_count: int, retry_after: datetime | None) -> int:
 async def _handle_retryable_error(
     job_id: UUID,
     stage_name: str,
-    error: TranscriptionProviderError | MediaProcessingError,
+    error: ProviderError | MediaProcessingError,
     retry_count: int,
 ) -> None:
     settings = get_settings()
-    if isinstance(error, TranscriptionProviderError) and error.quota:
+    if isinstance(error, ProviderError) and error.quota:
         await pause_job_for_quota(
             job_id,
             stage_name,
@@ -946,9 +1545,7 @@ async def _handle_retryable_error(
             error.user_message,
             _retry_delay(
                 retry_count,
-                error.retry_after
-                if isinstance(error, TranscriptionProviderError)
-                else None,
+                error.retry_after if isinstance(error, ProviderError) else None,
             ),
         ) from error
     await mark_job_failed(
@@ -960,6 +1557,33 @@ async def _handle_retryable_error(
     )
 
 
+async def _record_branch_failures(
+    job_id: UUID,
+    failures: list[BranchProcessingError],
+) -> None:
+    now = datetime.now(timezone.utc)
+    async with SessionLocal() as session:
+        async with session.begin():
+            for failure in failures:
+                stage = await session.scalar(
+                    select(ProcessingStage)
+                    .where(
+                        ProcessingStage.job_id == job_id,
+                        ProcessingStage.name == failure.stage_name,
+                    )
+                    .with_for_update()
+                )
+                if stage is None:
+                    continue
+                stage.status = StageStatus.FAILED
+                stage.finished_at = now
+                stage.last_error = {
+                    "code": failure.error.code,
+                    "user_message": failure.error.user_message,
+                    "retryable": failure.error.retryable,
+                }
+
+
 async def process_ingestion_job(job_id: UUID, retry_count: int = 0) -> None:
     lock_connection = await _try_job_lock(job_id)
     if lock_connection is None:
@@ -967,14 +1591,13 @@ async def process_ingestion_job(job_id: UUID, retry_count: int = 0) -> None:
 
     stop_heartbeat = asyncio.Event()
     heartbeat_task: asyncio.Task[None] | None = None
-    current_stage = "media_preparation"
     try:
         try:
             context = await _claim_job(job_id)
-        except (TranscriptionProviderError, MediaProcessingError) as exc:
+        except (ProviderError, MediaProcessingError) as exc:
             await _handle_retryable_error(
                 job_id,
-                current_stage,
+                "media_preparation",
                 exc,
                 retry_count,
             )
@@ -984,138 +1607,66 @@ async def process_ingestion_job(job_id: UUID, retry_count: int = 0) -> None:
         heartbeat_task = asyncio.create_task(_heartbeat(job_id, stop_heartbeat))
 
         try:
-            if not context.original_path.is_file():
-                raise MediaProcessingError(
-                    "source_video_missing",
-                    "The original video file is missing from local storage.",
-                    retryable=False,
-                )
-            await _run_stage(
+            if not context.work_dir.is_dir():
+                await _reset_stage(job_id, "media_preparation")
+            await _run_branch_stage(
                 context,
                 "media_preparation",
                 lambda: _run_media_preparation(context),
             )
-            if not context.has_audio or await _is_cancelled(job_id):
-                await _finish_pipeline_at_phase_boundary(job_id)
-                return
-
-            current_stage = "audio_extraction"
-            audio_path: Path | None = None
-            audio_duration: float | None = None
-            if not (context.work_dir / "audio" / "audio.flac").is_file():
-                await _reset_stage(job_id, current_stage)
-
-            async def extract() -> dict[str, Any]:
-                nonlocal audio_path, audio_duration
-                audio_path, audio_duration = await _prepare_audio(context)
-                return {
-                    "audio_path": str(audio_path),
-                    "duration_seconds": audio_duration,
-                }
-
-            if await _run_stage(context, current_stage, extract):
-                pass
-            else:
-                checkpoint = await _stage_checkpoint(job_id, current_stage)
-                if checkpoint:
-                    audio_path = Path(checkpoint["audio_path"])
-                    audio_duration = float(checkpoint["duration_seconds"])
-            if await _is_cancelled(job_id):
-                return
-            if audio_path is None or audio_duration is None:
-                checkpoint = await _stage_checkpoint(job_id, current_stage)
-                try:
-                    audio_path = Path(checkpoint["audio_path"])
-                    audio_duration = float(checkpoint["duration_seconds"])
-                except (KeyError, TypeError, ValueError) as exc:
-                    raise MediaProcessingError(
-                        "audio_checkpoint_invalid",
-                        "The saved audio extraction checkpoint is invalid.",
-                        retryable=False,
-                    ) from exc
-            if (
-                not audio_path.is_file()
-                or not math.isfinite(audio_duration)
-                or audio_duration <= 0
-            ):
-                raise MediaProcessingError(
-                    "audio_checkpoint_invalid",
-                    "The extracted audio file or its duration is invalid.",
-                    retryable=False,
-                )
-
-            current_stage = "audio_segmentation"
-            segment_checkpoint = await _stage_checkpoint(job_id, current_stage)
-            saved_segments = segment_checkpoint.get("segments", [])
-            if not isinstance(saved_segments, list) or not saved_segments or any(
-                not _segment_artifact_exists(context, item, "flac")
-                for item in saved_segments
-            ):
-                await _reset_stage(job_id, current_stage)
-
-            async def segment() -> dict[str, Any]:
-                segments = await _create_audio_segments(
-                    context,
-                    audio_path,
-                    audio_duration,
-                )
-                return {
-                    "segments": [
-                        {
-                            "index": item.index,
-                            "path": str(item.path),
-                            "start_seconds": item.start_seconds,
-                            "duration_seconds": item.duration_seconds,
-                        }
-                        for item in segments
-                    ]
-                }
-
-            if await _run_stage(context, current_stage, segment):
-                pass
             if await _is_cancelled(job_id):
                 return
 
-            current_stage = "transcription"
-            segmentation_checkpoint = await _stage_checkpoint(
-                job_id,
-                "audio_segmentation",
+            results = await asyncio.gather(
+                _run_audio_branch(context),
+                _run_visual_branch(context),
+                return_exceptions=True,
             )
-            raw_segments = segmentation_checkpoint.get("segments", [])
-            if not isinstance(raw_segments, list) or any(
-                not _segment_artifact_exists(
-                    context,
-                    item,
-                    "transcript.json",
+            failures = [
+                result
+                for result in results
+                if isinstance(result, BranchProcessingError)
+            ]
+            unexpected = [
+                result
+                for result in results
+                if isinstance(result, Exception)
+                and not isinstance(result, BranchProcessingError)
+            ]
+            if unexpected:
+                raise unexpected[0]
+            if failures:
+                await _record_branch_failures(job_id, failures)
+                selected = next(
+                    (
+                        failure
+                        for failure in failures
+                        if isinstance(failure.error, ProviderError)
+                        and failure.error.quota
+                    ),
+                    failures[0],
                 )
-                for item in raw_segments
-            ):
-                await _reset_stage(job_id, current_stage)
-
-            async def transcribe() -> dict[str, Any]:
-                await _transcribe_segments(context)
-                return await _stage_checkpoint(job_id, current_stage)
-
-            if await _run_stage(context, current_stage, transcribe):
-                pass
+                await _handle_retryable_error(
+                    job_id,
+                    selected.stage_name,
+                    selected.error,
+                    retry_count,
+                )
+                return
             if await _is_cancelled(job_id):
                 return
-
-            current_stage = "transcript_chunking"
-            chunk_checkpoint = await _stage_checkpoint(job_id, current_stage)
-            chunk_path = chunk_checkpoint.get("output_path")
-            if not isinstance(chunk_path, str) or not Path(chunk_path).is_file():
-                await _reset_stage(job_id, current_stage)
-            await _run_stage(
-                context,
-                current_stage,
-                lambda: _chunk_transcript(context),
-            )
             await _finish_pipeline_at_phase_boundary(job_id)
-        except (TranscriptionProviderError, MediaProcessingError) as exc:
+        except BranchProcessingError as exc:
             await _handle_retryable_error(
                 job_id,
-                current_stage,
+                exc.stage_name,
+                exc.error,
+                retry_count,
+            )
+        except (ProviderError, MediaProcessingError) as exc:
+            await _handle_retryable_error(
+                job_id,
+                "media_preparation",
                 exc,
                 retry_count,
             )

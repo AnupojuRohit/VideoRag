@@ -78,13 +78,13 @@ At question time: query embedding → vector search and keyword search in parall
 | Media extraction | FFmpeg |
 | Scene detection | PySceneDetect |
 | Transcription | Provider adapter; Gemini is a candidate |
-| Vision | Online multimodal model; Gemini Flash is a candidate |
+| Vision | Gemini 3.8 Flash (`gemini-3.8-flash`), Interactions API |
 | Embeddings | Online embedding model; Gemini embedding model is a candidate |
 | Answer generation | Online LLM; Gemini Flash is a candidate |
 | Testing | pytest + Playwright |
 | Local infrastructure | Docker Compose |
 
-**Provider IDs and availability are not frozen.** Before implementation, verify exact current model IDs, endpoint support, free-tier quotas, rate limits, file/video limits, regional availability, and data-use terms from official documentation. Do not code against guessed model names.
+**Provider IDs and availability are verified per adapter and may change.** The visual adapter uses the documented `gemini-3.8-flash` image input on the Interactions API with stateless requests. Google's model documentation currently lists a free standard tier, but quotas are account-specific and not guaranteed. Unpaid-tier content may be used to improve Google products and human-reviewed; the terms require 18+ and professional/business use and prohibit consumer-use apps or apps directed to minors. See the [model documentation](https://ai.google.dev/gemini-api/docs/models/gemini-3.8-flash), [image understanding guide](https://ai.google.dev/gemini-api/docs/image-understanding), [Interactions API](https://ai.google.dev/gemini-api/docs/interactions), and [terms](https://ai.google.dev/gemini-api/terms). Recheck official documentation before live use or changing model IDs. Do not code against guessed capabilities or quota values.
 
 ### Provider abstraction
 
@@ -546,7 +546,7 @@ Create files incrementally as each phase is implemented; do not generate a huge 
 | 2 | Upload + SHA-256: validation, local storage, browser preflight, server verification, unique constraint | Re-uploading exact bytes reuses the existing asset |
 | 3 | Durable job orchestration: Celery dispatch, PostgreSQL reconciliation, leases, retries, quota pause, status/control APIs | Jobs recover safely after restart without treating Redis as durable state |
 | 4 | Media preparation and audio: FFmpeg, bounded segments, verified online transcription, original-timeline timestamps, transcript artifacts | Timestamped audio evidence is checkpointed locally; asset stays non-READY |
-| 5 | Visual pipeline: scene detection, frame sampling, dedup, OCR, online vision | Timestamped visual evidence is produced |
+| 5 | Visual pipeline: scene detection, frame sampling, dedup, OCR, online vision | Timestamped visual evidence is checkpointed locally; audio and visual branches run concurrently; asset stays non-READY |
 | 6 | Shared indexing: normalization, online embeddings, batching, pgvector, FTS | Both modalities are indexed and verified |
 | 7 | Hybrid retrieval: vector search, keyword search, RRF | Relevant evidence is retrieved for test questions |
 | 8 | Grounded Q&A: context assembly, generation, evidence, abstention | Answers cite supported evidence and timestamps |

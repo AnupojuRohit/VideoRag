@@ -27,6 +27,27 @@ class Settings(BaseSettings):
     ffmpeg_timeout_seconds: int = Field(default=1800, gt=0)
     ffprobe_path: str = "ffprobe"
     ffprobe_timeout_seconds: int = Field(default=30, gt=0)
+    scene_detection_timeout_seconds: int = Field(default=1800, gt=0)
+    scene_threshold: float = Field(default=27, gt=0, allow_inf_nan=False)
+    frame_extraction_timeout_seconds: int = Field(default=60, gt=0)
+    frame_sampling_interval_seconds: float = Field(
+        default=15,
+        gt=0,
+        allow_inf_nan=False,
+    )
+    frame_min_spacing_seconds: float = Field(
+        default=2,
+        ge=0,
+        allow_inf_nan=False,
+    )
+    max_frames_per_video: int = Field(default=120, gt=0, le=1000)
+    frame_max_dimension: int = Field(default=1280, gt=0, le=4096)
+    perceptual_hash_distance: int = Field(default=4, ge=0, le=64)
+    tesseract_path: str = "tesseract"
+    tesseract_language: str = "eng"
+    ocr_timeout_seconds: int = Field(default=20, gt=0)
+    vision_request_timeout_seconds: int = Field(default=180, gt=0)
+    vision_max_image_bytes: int = Field(default=10_000_000, gt=0, le=14_000_000)
     audio_segment_seconds: float = Field(default=1500, gt=0, lt=1800)
     audio_segment_overlap_seconds: float = Field(default=2, ge=0, lt=30)
     transcription_request_timeout_seconds: int = Field(default=600, gt=0)
@@ -37,9 +58,12 @@ class Settings(BaseSettings):
     worker_concurrency: int = Field(default=2, gt=0)
     gemini_api_key: SecretStr | None = None
     gemini_unpaid_api_acknowledged: bool = False
-    embedding_model_id: str | None = None
-    embedding_model_version: str | None = None
-    embedding_dimension: int | None = Field(default=None, gt=0)
+    gemini_api_terms_acknowledged: bool = False
+    embedding_model_id: str | None = "gemini-embedding-001"
+    embedding_model_version: str | None = "stable"
+    embedding_dimension: int | None = Field(default=768, gt=0)
+    embedding_batch_size: int = Field(default=4, gt=0, le=16)
+    embedding_request_timeout_seconds: int = Field(default=120, gt=0)
 
     @model_validator(mode="after")
     def validate_embedding_configuration(self) -> "Settings":
@@ -57,11 +81,15 @@ class Settings(BaseSettings):
         if (
             self.gemini_api_key is not None
             and self.gemini_api_key.get_secret_value().strip()
-            and not self.gemini_unpaid_api_acknowledged
+            and (
+                not self.gemini_unpaid_api_acknowledged
+                or not self.gemini_api_terms_acknowledged
+            )
         ):
             raise ValueError(
-                "Gemini API use requires explicit acknowledgement of unpaid-tier "
-                "data terms and a project without active billing"
+                "Gemini API use requires acknowledgement of the unpaid-tier data "
+                "terms, age and professional-use requirements, and a project "
+                "without active billing"
             )
         if self.audio_segment_overlap_seconds >= self.audio_segment_seconds:
             raise ValueError(

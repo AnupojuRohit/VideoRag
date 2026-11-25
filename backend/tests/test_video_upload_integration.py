@@ -33,6 +33,10 @@ from app.providers.transcription import (
     TranscribedWord,
     TranscriptionResult,
 )
+from app.providers.errors import VisionProviderError
+from app.providers.vision import VisionResult
+from app.services.media.scene_detection import DetectedScene
+from app.services.media.video_frames import SelectedFrame
 
 pytestmark = [
     pytest.mark.integration,
@@ -401,10 +405,24 @@ async def test_audio_pipeline_persists_timestamped_local_chunks(
     tracked_assets: list[UUID],
     monkeypatch,
 ) -> None:
+    active_provider_calls = 0
+    max_active_provider_calls = 0
+    both_providers_started = asyncio.Event()
+
     class FakeTranscriptionProvider:
         async def transcribe(self, audio_path: Path, mime_type: str) -> TranscriptionResult:
+            nonlocal active_provider_calls, max_active_provider_calls
             assert audio_path.is_file()
             assert mime_type == "audio/flac"
+            active_provider_calls += 1
+            max_active_provider_calls = max(
+                max_active_provider_calls,
+                active_provider_calls,
+            )
+            if active_provider_calls == 2:
+                both_providers_started.set()
+            await asyncio.wait_for(both_providers_started.wait(), timeout=2)
+            active_provider_calls -= 1
             return TranscriptionResult(
                 text="Hello world",
                 words=[
@@ -422,11 +440,72 @@ async def test_audio_pipeline_persists_timestamped_local_chunks(
                 ),
             )
 
+    class FakeVisionProvider:
+        async def describe_frame(self, image_path: Path, ocr_text: str) -> VisionResult:
+            nonlocal active_provider_calls, max_active_provider_calls
+            assert image_path.is_file()
+            assert ocr_text == "test slide text"
+            active_provider_calls += 1
+            max_active_provider_calls = max(
+                max_active_provider_calls,
+                active_provider_calls,
+            )
+            if active_provider_calls == 2:
+                both_providers_started.set()
+            await asyncio.wait_for(both_providers_started.wait(), timeout=2)
+            active_provider_calls -= 1
+            return VisionResult(
+                description="A test slide with a blue heading.",
+                usage=ProviderUsage(
+                    provider="test",
+                    model_id="test-vision",
+                    operation="vision",
+                    status_code=200,
+                    latency_ms=1,
+                    input_bytes=10,
+                    request_id="test-vision-request",
+                ),
+            )
+
+    async def fake_detect_scenes(
+        _: Path,
+        __: float,
+        ___: int,
+    ) -> list[DetectedScene]:
+        return [DetectedScene(start_seconds=0, end_seconds=1)]
+
+    async def fake_extract_frames(
+        _: Path,
+        timestamps: list[float],
+        output_dir: Path,
+        **__: object,
+    ) -> list[SelectedFrame]:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        frame_path = output_dir / "frame-00000.jpg"
+        from PIL import Image
+
+        Image.new("RGB", (16, 16), color="blue").save(frame_path)
+        return [
+            SelectedFrame(
+                index=0,
+                timestamp_seconds=timestamps[0],
+                path=frame_path,
+            )
+        ]
+
     monkeypatch.setattr(
         pipeline,
         "create_transcription_provider",
         FakeTranscriptionProvider,
     )
+    monkeypatch.setattr(
+        pipeline,
+        "create_vision_provider",
+        FakeVisionProvider,
+    )
+    monkeypatch.setattr(pipeline, "detect_scenes", fake_detect_scenes)
+    monkeypatch.setattr(pipeline, "extract_selected_frames", fake_extract_frames)
+    monkeypatch.setattr(pipeline, "extract_visible_text", lambda _: "test slide text")
     async with await _client() as client:
         response = await client.post(
             "/api/v1/videos/upload?filename=audio-pipeline.mp4",
@@ -476,7 +555,12 @@ async def test_audio_pipeline_persists_timestamped_local_chunks(
     assert stages["audio_segmentation"].value == "COMPLETED"
     assert stages["transcription"].value == "COMPLETED"
     assert stages["transcript_chunking"].value == "COMPLETED"
-    assert usage_count == 1
+    assert stages["scene_detection"].value == "COMPLETED"
+    assert stages["frame_extraction"].value == "COMPLETED"
+    assert stages["ocr"].value == "COMPLETED"
+    assert stages["visual_analysis"].value == "COMPLETED"
+    assert usage_count == 2
+    assert max_active_provider_calls == 2
     chunks_path = (
         temporary_media_root
         / "work"
@@ -488,3 +572,137 @@ async def test_audio_pipeline_persists_timestamped_local_chunks(
     assert transcript_chunks["timeline"] == "original_video"
     assert transcript_chunks["chunks"][0]["start_time"] == 2.1
     assert transcript_chunks["chunks"][0]["end_time"] == 2.8
+    visual_path = (
+        temporary_media_root
+        / "work"
+        / str(asset_id)
+        / "visual"
+        / "visual-evidence.json"
+    )
+    visual_evidence = json.loads(visual_path.read_text(encoding="utf-8"))
+    assert visual_evidence["timeline"] == "original_video"
+    assert visual_evidence["evidence"][0]["start_time"] == 0.5
+
+
+@pytest.mark.asyncio
+async def test_visual_failure_preserves_completed_audio_artifacts(
+    valid_mp4_bytes: bytes,
+    temporary_media_root: Path,
+    tracked_assets: list[UUID],
+    monkeypatch,
+) -> None:
+    class FakeTranscriptionProvider:
+        async def transcribe(
+            self,
+            audio_path: Path,
+            mime_type: str,
+        ) -> TranscriptionResult:
+            assert audio_path.is_file()
+            return TranscriptionResult(
+                text="Audio evidence",
+                words=[TranscribedWord("Audio", 0.1, 0.3)],
+                usage=ProviderUsage(
+                    provider="test",
+                    model_id="test-transcriber",
+                    operation="transcription",
+                    status_code=200,
+                    latency_ms=1,
+                    input_bytes=10,
+                    request_id="test-audio-request",
+                ),
+            )
+
+    class FailingVisionProvider:
+        async def describe_frame(self, image_path: Path, ocr_text: str) -> VisionResult:
+            raise VisionProviderError(
+                "vision_rejected",
+                "The test vision request was rejected.",
+                retryable=False,
+            )
+
+    async def fake_detect_scenes(
+        _: Path,
+        __: float,
+        ___: int,
+    ) -> list[DetectedScene]:
+        return [DetectedScene(start_seconds=0, end_seconds=1)]
+
+    async def fake_extract_frames(
+        _: Path,
+        timestamps: list[float],
+        output_dir: Path,
+        **__: object,
+    ) -> list[SelectedFrame]:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        frame_path = output_dir / "frame-00000.jpg"
+        from PIL import Image
+
+        Image.new("RGB", (16, 16), color="blue").save(frame_path)
+        return [
+            SelectedFrame(
+                index=0,
+                timestamp_seconds=timestamps[0],
+                path=frame_path,
+            )
+        ]
+
+    monkeypatch.setattr(
+        pipeline,
+        "create_transcription_provider",
+        FakeTranscriptionProvider,
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "create_vision_provider",
+        FailingVisionProvider,
+    )
+    monkeypatch.setattr(pipeline, "detect_scenes", fake_detect_scenes)
+    monkeypatch.setattr(pipeline, "extract_selected_frames", fake_extract_frames)
+    monkeypatch.setattr(pipeline, "extract_visible_text", lambda _: "visible words")
+
+    async with await _client() as client:
+        response = await client.post(
+            "/api/v1/videos/upload?filename=visual-failure.mp4",
+            content=valid_mp4_bytes,
+            headers=_upload_headers(valid_mp4_bytes),
+        )
+    assert response.status_code == 200, response.text
+    upload = response.json()
+    asset_id = UUID(upload["asset_id"])
+    job_id = UUID(upload["job_id"])
+    tracked_assets.append(asset_id)
+
+    async with SessionLocal() as session:
+        asset = await session.get(VideoAsset, asset_id)
+        assert asset is not None
+        asset.duration_seconds = 10
+        await session.commit()
+
+    await pipeline.process_ingestion_job(job_id)
+
+    async with SessionLocal() as session:
+        job = await session.get(ProcessingJob, job_id)
+        assert job is not None
+        stages = {
+            stage.name: stage
+            for stage in (
+                await session.scalars(
+                    select(ProcessingStage).where(
+                        ProcessingStage.job_id == job_id
+                    )
+                )
+            ).all()
+        }
+
+    transcript_path = (
+        temporary_media_root
+        / "work"
+        / str(asset_id)
+        / "audio"
+        / "transcript-chunks.json"
+    )
+    assert job.status.value == "FAILED"
+    assert stages["transcript_chunking"].status.value == "COMPLETED"
+    assert stages["visual_analysis"].status.value == "FAILED"
+    assert transcript_path.is_file()
+    assert json.loads(transcript_path.read_text(encoding="utf-8"))["chunks"]

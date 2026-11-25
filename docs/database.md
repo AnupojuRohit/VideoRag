@@ -35,7 +35,10 @@ abandoned work after a worker/container restart. Redis stores no durable job
 state and the Celery result backend is disabled.
 
 Audio artifacts and transcripts are checkpointed under
-`data/work/<asset_id>/audio/` on local storage. Until shared indexing is
+`data/work/<asset_id>/audio/`; sampled frames, per-frame OCR, descriptions, and
+the visual evidence manifest are under `data/work/<asset_id>/visual/`. Each
+branch has independent stage checkpoints, and provider usage records include
+token counts when the provider returns them. Until shared indexing is
 implemented, these artifacts are not searchable and the asset is not READY.
 
 ## Index consistency

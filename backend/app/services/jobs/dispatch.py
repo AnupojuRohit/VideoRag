@@ -6,6 +6,7 @@ from kombu.exceptions import OperationalError
 from sqlalchemy import select
 
 from app.core.config import get_settings
+from app.core.privacy import EXTERNAL_PROCESSING_CONSENT_VERSION
 from app.db.session import SessionLocal
 from app.models.enums import LifecycleStatus
 from app.models.processing_job import ProcessingJob
@@ -35,7 +36,11 @@ async def schedule_job(job_id: UUID) -> LifecycleStatus | None:
                     extra={"job_id": str(job_id)},
                 )
                 return None
-            if not asset.external_processing_consent:
+            if (
+                not asset.external_processing_consent
+                or asset.external_processing_consent_version
+                != EXTERNAL_PROCESSING_CONSENT_VERSION
+            ):
                 return job.status
 
             can_schedule = job.status in {
@@ -92,6 +97,10 @@ async def reconcile_jobs(batch_size: int = 100) -> int:
                         .join(VideoAsset, VideoAsset.id == ProcessingJob.video_id)
                         .where(
                             VideoAsset.external_processing_consent.is_(True),
+                            (
+                                VideoAsset.external_processing_consent_version
+                                == EXTERNAL_PROCESSING_CONSENT_VERSION
+                            ),
                             (
                                 (
                                     ProcessingJob.status.in_(

@@ -35,7 +35,10 @@ async def upload_preflight(
         job_id=job.id if job else None,
         status=asset.status,
         retry_available=action == "retry_available",
-        external_processing_consent=asset.external_processing_consent,
+        external_processing_consent=(
+            asset.external_processing_consent
+            and asset.external_processing_consent_version == CONSENT_VERSION
+        ),
     )
 
 

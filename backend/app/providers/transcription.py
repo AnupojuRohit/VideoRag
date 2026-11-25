@@ -21,6 +21,8 @@ class ProviderUsage:
     input_bytes: int | None
     request_id: str | None
     cleanup_error: str | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
 
 
 @dataclass(frozen=True)

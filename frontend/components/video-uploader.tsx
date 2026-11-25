@@ -260,10 +260,13 @@ export default function VideoUploader() {
             onChange={(event) => setConsentAccepted(event.currentTarget.checked)}
           />
           <span>
-            I agree to send audio and video-derived content to the configured
-            free-tier AI provider for processing. The unpaid Gemini tier may use
-            submitted content to improve Google products and may be human-reviewed.
-            I will not submit sensitive, confidential, or personal content.
+            I agree to send audio, transcripts, selected frames, and OCR text to
+            the configured free-tier AI provider. Unpaid Gemini content may be
+            used to improve Google products and may be human-reviewed. I will not
+            submit sensitive, confidential, or personal content.
+            {" "}Gemini API use requires an operator aged 18 or older and a
+            professional or business purpose; it is not for consumer-use apps
+            or apps directed to minors.
           </span>
         </label>
         <button className="upload-button" type="submit" disabled={!file || busy}>

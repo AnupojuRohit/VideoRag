@@ -53,11 +53,16 @@ Request:
 ```
 
 This records a versioned, per-asset acknowledgement that audio/video-derived
-content may be sent to the configured external AI provider. The frontend
-discloses that Gemini's unpaid tier may use submitted content to improve Google
-products and may be human-reviewed. Do not upload sensitive, confidential, or
-personal content. Separately, provider calls remain disabled until an API key
-and explicit unpaid-project configuration are provided in the local environment.
+content—including audio, transcript text, selected frames, and OCR—may be sent
+to the configured external AI provider. The frontend discloses that Gemini's
+unpaid tier may use submitted content to improve Google products and may be
+human-reviewed. Do not upload sensitive, confidential, or personal content.
+Google's terms also require an 18+ operator and professional or business use;
+consumer-use applications and applications directed to minors are not eligible.
+Provider calls remain unavailable until an API key, no-active-billing project,
+unpaid-data acknowledgement, and terms acknowledgement are configured locally.
+The consent version is updated when the disclosed data types or provider terms
+change; older assets must be explicitly re-consented before processing resumes.
 
 ## Upload video bytes
 
@@ -148,5 +153,24 @@ recorded; the Files API's documented automatic expiry is 48 hours. The adapter
 is based on [Google's transcription documentation](https://ai.google.dev/gemini-api/docs/transcribe)
 and [data-use terms](https://ai.google.dev/gemini-api/terms).
 
-Asset/library listing, video detail, question/answer, visual processing, and
-shared indexing are not implemented yet.
+## Phase 5 visual evidence
+
+The worker runs audio and visual branches concurrently after media preparation.
+Visual processing uses PySceneDetect, configured scene-center plus interval
+sampling, FFmpeg frame extraction with a per-video cap and resize bound,
+perceptual-hash duplicate filtering, and local Tesseract OCR. Selected frames
+and their OCR context are sent to Gemini 3.8 Flash through the Interactions API
+using inline JPEG data and `store: false`; no provider-side file upload is used.
+The adapter records available usage metadata and maps quota responses to the
+existing `PAUSED_QUOTA` workflow.
+
+Scene, frame, OCR, and description results are checkpointed per asset on local
+storage and in `processing_stages`. Audio and visual failures are isolated;
+successful artifacts from the other branch are retained. The API still reports
+the job as `PROCESSING` after both evidence branches complete because shared
+embedding, FTS indexing, and verification are not implemented yet. No asset is
+marked `READY` at this phase boundary.
+
+Asset/library listing, video detail, question/answer, and shared indexing are
+not implemented yet. YouTube audiovisual downloading is not enabled; do not
+use a downloader unless a compliant authorized acquisition route is approved.

@@ -61,12 +61,16 @@ def test_duplicate_actions_cover_asset_lifecycle(
 
 def test_embedding_settings_require_model_version_and_dimension_together() -> None:
     with pytest.raises(ValidationError):
-        Settings(embedding_model_id="unverified-model")
+        Settings(
+            embedding_model_id="unverified-model",
+            embedding_model_version=None,
+            embedding_dimension=None,
+        )
 
     settings = Settings(
         embedding_model_id="verified-model",
         embedding_model_version="v1",
-        embedding_dimension=3,
+        embedding_dimension=768,
     )
     assert settings.embedding_dimension == 3
 
@@ -75,9 +79,16 @@ def test_gemini_key_requires_unpaid_tier_data_acknowledgement() -> None:
     with pytest.raises(ValidationError):
         Settings(gemini_api_key="test-only-key")
 
+    with pytest.raises(ValidationError):
+        Settings(
+            gemini_api_key="test-only-key",
+            gemini_unpaid_api_acknowledged=True,
+        )
+
     settings = Settings(
         gemini_api_key="test-only-key",
         gemini_unpaid_api_acknowledged=True,
+        gemini_api_terms_acknowledged=True,
     )
     assert settings.gemini_api_key is not None
 
