@@ -38,11 +38,11 @@ from app.providers.transcription import (
     TranscriptionResult,
 )
 from app.providers.embedding import EmbeddingResult
-from app.providers.errors import VisionProviderError
+from app.providers.errors import TranscriptionProviderError, VisionProviderError
 from app.providers.vision import VisionResult
 from app.services.media.scene_detection import DetectedScene
 from app.services.media.video_frames import SelectedFrame
-from app.services.media.audio import MediaProcessingError
+from app.services.media.audio import AudioSegment, MediaProcessingError
 from app.services.retrieval import RetrievedEvidence, retrieve_video_evidence
 from app.services.jobs.orchestration import CONSENT_VERSION
 
@@ -573,6 +573,16 @@ async def test_hybrid_retrieval_scopes_video_and_fuses_modalities(
         provider=FakeEmbeddingProvider(),
     )
 
+    relevant_source_refs = {
+        "transcript:00001",
+        "visual:frame:00001",
+    }
+    retrieved_source_refs = {item.source_ref for item in result.evidence}
+    recall_at_10 = len(relevant_source_refs & retrieved_source_refs) / len(
+        relevant_source_refs
+    )
+    assert recall_at_10 == pytest.approx(1.0)
+    assert retrieved_source_refs == relevant_source_refs
     assert {item.chunk_type for item in result.evidence} == {
         ChunkType.TRANSCRIPT,
         ChunkType.VISUAL,
@@ -776,6 +786,10 @@ async def test_audio_pipeline_persists_timestamped_local_chunks(
     max_active_provider_calls = 0
     both_providers_started = asyncio.Event()
     embedding_calls = 0
+    fail_final_segment = True
+    indexed_before_final_segment = False
+    transcription_calls: list[int] = []
+    asset_id: UUID | None = None
 
     class FakeEmbeddingProvider:
         async def embed_texts(
@@ -802,24 +816,69 @@ async def test_audio_pipeline_persists_timestamped_local_chunks(
 
     class FakeTranscriptionProvider:
         async def transcribe(self, audio_path: Path, mime_type: str) -> TranscriptionResult:
-            nonlocal active_provider_calls, max_active_provider_calls
+            nonlocal active_provider_calls
+            nonlocal max_active_provider_calls
+            nonlocal fail_final_segment
+            nonlocal indexed_before_final_segment
             assert audio_path.is_file()
             assert mime_type == "audio/flac"
+            segment_index = int(audio_path.stem.rsplit("-", maxsplit=1)[1])
+            transcription_calls.append(segment_index)
             active_provider_calls += 1
             max_active_provider_calls = max(
                 max_active_provider_calls,
                 active_provider_calls,
             )
-            if active_provider_calls == 2:
+            if segment_index == 0 and active_provider_calls == 2:
                 both_providers_started.set()
-            await asyncio.wait_for(both_providers_started.wait(), timeout=2)
+            if segment_index == 0:
+                await asyncio.wait_for(both_providers_started.wait(), timeout=2)
             active_provider_calls -= 1
+            if segment_index == 2:
+                assert asset_id is not None
+                async with SessionLocal() as session:
+                    first_chunk = await session.scalar(
+                        select(VideoChunk).where(
+                            VideoChunk.video_id == asset_id,
+                            VideoChunk.chunk_type == ChunkType.TRANSCRIPT,
+                            VideoChunk.source_ref == "transcript:00000",
+                        )
+                    )
+                    transcription_status = await session.scalar(
+                        select(ProcessingStage.status).where(
+                            ProcessingStage.job_id == job_id,
+                            ProcessingStage.name == "transcription",
+                        )
+                    )
+                indexed_before_final_segment = (
+                    first_chunk is not None
+                    and first_chunk.content == "Hello."
+                    and transcription_status == StageStatus.RUNNING
+                )
+                if fail_final_segment:
+                    fail_final_segment = False
+                    raise TranscriptionProviderError(
+                        "test_later_segment_failure",
+                        "The final test segment failed.",
+                        retryable=True,
+                    )
+            text, words = {
+                0: (
+                    "Hello.",
+                    [TranscribedWord("Hello.", 0.1, 0.4)],
+                ),
+                1: (
+                    "world.",
+                    [TranscribedWord("world.", 1.5, 1.8)],
+                ),
+                2: (
+                    "Again.",
+                    [TranscribedWord("Again.", 2.5, 2.8)],
+                ),
+            }[segment_index]
             return TranscriptionResult(
-                text="Hello world",
-                words=[
-                    TranscribedWord("Hello", 0.1, 0.4),
-                    TranscribedWord("world.", 0.5, 0.8),
-                ],
+                text=text,
+                words=words,
                 usage=ProviderUsage(
                     provider="test",
                     model_id="test-transcriber",
@@ -827,7 +886,7 @@ async def test_audio_pipeline_persists_timestamped_local_chunks(
                     status_code=200,
                     latency_ms=1,
                     input_bytes=10,
-                    request_id="test-request",
+                    request_id=f"test-request-{segment_index}",
                 ),
             )
 
@@ -865,6 +924,26 @@ async def test_audio_pipeline_persists_timestamped_local_chunks(
     ) -> list[DetectedScene]:
         return [DetectedScene(start_seconds=0, end_seconds=1)]
 
+    async def fake_create_audio_segments(
+        context,
+        _: Path,
+        __: float,
+    ) -> list[AudioSegment]:
+        segments = []
+        for index, start_seconds in enumerate((0.0, 4.0, 8.0)):
+            path = context.work_dir / "audio" / f"segment-{index:05d}.flac"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"test audio")
+            segments.append(
+                AudioSegment(
+                    index=index,
+                    path=path,
+                    start_seconds=start_seconds,
+                    duration_seconds=6.0,
+                )
+            )
+        return segments
+
     async def fake_extract_frames(
         _: Path,
         timestamps: list[float],
@@ -895,6 +974,11 @@ async def test_audio_pipeline_persists_timestamped_local_chunks(
         FakeVisionProvider,
     )
     monkeypatch.setattr(pipeline, "detect_scenes", fake_detect_scenes)
+    monkeypatch.setattr(
+        pipeline,
+        "_create_audio_segments",
+        fake_create_audio_segments,
+    )
     monkeypatch.setattr(pipeline, "extract_selected_frames", fake_extract_frames)
     monkeypatch.setattr(pipeline, "extract_visible_text", lambda _: "test slide text")
     monkeypatch.setattr(
@@ -923,11 +1007,31 @@ async def test_audio_pipeline_persists_timestamped_local_chunks(
     async with SessionLocal() as session:
         asset = await session.get(VideoAsset, asset_id)
         assert asset is not None
-        asset.duration_seconds = 10
+        asset.duration_seconds = 20
         asset.audio_start_time = 2
         await session.commit()
 
     await pipeline.process_ingestion_job(job_id)
+
+    assert indexed_before_final_segment
+    async with SessionLocal() as session:
+        failed_job = await session.get(ProcessingJob, job_id)
+        failed_asset = await session.get(VideoAsset, asset_id)
+        first_chunk = await session.scalar(
+            select(VideoChunk).where(
+                VideoChunk.video_id == asset_id,
+                VideoChunk.chunk_type == ChunkType.TRANSCRIPT,
+                VideoChunk.source_ref == "transcript:00000",
+            )
+        )
+    assert failed_job is not None and failed_job.status == LifecycleStatus.FAILED
+    assert failed_asset is not None and failed_asset.status == LifecycleStatus.FAILED
+    assert first_chunk is not None and first_chunk.content == "Hello."
+
+    retry = await orchestration.retry_job(job_id)
+    assert retry.status == LifecycleStatus.QUEUED
+    await pipeline.process_ingestion_job(job_id)
+    assert transcription_calls == [0, 1, 2, 2]
 
     async with SessionLocal() as session:
         active_version = await session.scalar(
@@ -971,9 +1075,9 @@ async def test_audio_pipeline_persists_timestamped_local_chunks(
     assert stages["embeddings"].value == "COMPLETED"
     assert stages["indexing"].value == "COMPLETED"
     assert stages["verification"].value == "COMPLETED"
-    assert usage_count == 4
+    assert usage_count >= 6
     assert max_active_provider_calls == 2
-    assert embedding_calls >= 2
+    assert embedding_calls >= 3
     chunks_path = (
         temporary_media_root
         / "work"
@@ -983,8 +1087,15 @@ async def test_audio_pipeline_persists_timestamped_local_chunks(
     )
     transcript_chunks = json.loads(chunks_path.read_text(encoding="utf-8"))
     assert transcript_chunks["timeline"] == "original_video"
+    assert [chunk["content"] for chunk in transcript_chunks["chunks"]] == [
+        "Hello.",
+        "world.",
+        "Again.",
+    ]
     assert transcript_chunks["chunks"][0]["start_time"] == 2.1
-    assert transcript_chunks["chunks"][0]["end_time"] == 2.8
+    assert transcript_chunks["chunks"][0]["end_time"] == 2.4
+    assert transcript_chunks["chunks"][1]["start_time"] == 7.5
+    assert transcript_chunks["chunks"][2]["start_time"] == 12.5
     embedding_calls_before_retry = embedding_calls
     assert (
         await shared_indexing.index_evidence(
@@ -1020,6 +1131,13 @@ async def test_audio_pipeline_persists_timestamped_local_chunks(
         assert all(chunk.embedding is not None for chunk in chunks)
         assert all(len(chunk.embedding) == 768 for chunk in chunks)
         assert all(str(chunk.search_vector) for chunk in chunks)
+        transcript_refs = [
+            chunk.source_ref
+            for chunk in chunks
+            if chunk.chunk_type == ChunkType.TRANSCRIPT
+        ]
+        assert len(transcript_refs) == 3
+        assert len(set(transcript_refs)) == 3
 
 
 @pytest.mark.asyncio

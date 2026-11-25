@@ -758,7 +758,7 @@ async def _transcribe_segments(context: JobContext) -> None:
             retryable=False,
         )
     completed = set(completed_values)
-    for raw_segment in raw_segments:
+    for segment_position, raw_segment in enumerate(raw_segments):
         if not isinstance(raw_segment, dict):
             raise MediaProcessingError(
                 "audio_checkpoint_invalid",
@@ -793,24 +793,38 @@ async def _transcribe_segments(context: JobContext) -> None:
         )
         transcript_path = segment.path.with_suffix(".transcript.json")
         if segment.index in completed:
+            await _index_transcript_prefix(
+                context,
+                raw_segments,
+                segment_position,
+            )
             continue
         if transcript_path.is_file():
+            artifact = None
             try:
                 artifact = await _read_json(transcript_path)
-                if artifact.get("segment_index") == segment.index:
-                    completed.add(segment.index)
-                    stage_checkpoint = {
-                        **stage_checkpoint,
-                        "completed_segments": sorted(completed),
-                    }
-                    await _save_stage_checkpoint(
-                        context.job_id,
-                        "transcription",
-                        stage_checkpoint,
-                    )
-                    continue
             except MediaProcessingError:
                 pass
+            if (
+                isinstance(artifact, dict)
+                and artifact.get("segment_index") == segment.index
+            ):
+                completed.add(segment.index)
+                stage_checkpoint = {
+                    **stage_checkpoint,
+                    "completed_segments": sorted(completed),
+                }
+                await _save_stage_checkpoint(
+                    context.job_id,
+                    "transcription",
+                    stage_checkpoint,
+                )
+                await _index_transcript_prefix(
+                    context,
+                    raw_segments,
+                    segment_position,
+                )
+                continue
 
         try:
             if provider is None:
@@ -852,6 +866,11 @@ async def _transcribe_segments(context: JobContext) -> None:
             context.job_id,
             "transcription",
             stage_checkpoint,
+        )
+        await _index_transcript_prefix(
+            context,
+            raw_segments,
+            segment_position,
         )
 
 
@@ -951,6 +970,79 @@ def _make_transcript_chunks(
             }
         )
     return chunks
+
+
+async def _index_transcript_prefix(
+    context: JobContext,
+    raw_segments: list[dict[str, Any]],
+    segment_position: int,
+) -> None:
+    prefix_segments = raw_segments[: segment_position + 1]
+    segment_words: list[list[dict[str, Any]]] = []
+    for raw_segment in prefix_segments:
+        try:
+            segment_index = int(raw_segment["index"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise MediaProcessingError(
+                "audio_checkpoint_invalid",
+                "The saved audio segment checkpoint is invalid.",
+                retryable=False,
+            ) from exc
+        artifact = await _read_json(
+            context.work_dir
+            / "audio"
+            / f"segment-{segment_index:05d}.transcript.json"
+        )
+        if artifact.get("segment_index") != segment_index:
+            raise MediaProcessingError(
+                "transcript_artifact_invalid",
+                "A saved transcript segment does not match its audio segment.",
+                retryable=False,
+            )
+        words = artifact.get("words", [])
+        if not isinstance(words, list):
+            raise MediaProcessingError(
+                "transcript_artifact_invalid",
+                "A saved transcript segment has invalid word data.",
+                retryable=False,
+            )
+        segment_words.append(words)
+
+    settings = get_settings()
+    deduplicated = reconcile_overlapping_words(
+        prefix_segments,
+        segment_words,
+        settings.audio_segment_overlap_seconds,
+        context.audio_start_time,
+    )
+    chunks = _make_transcript_chunks(deduplicated)
+    if segment_position + 1 < len(raw_segments):
+        try:
+            next_start = float(raw_segments[segment_position + 1]["start_seconds"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise MediaProcessingError(
+                "audio_checkpoint_invalid",
+                "The saved audio segment checkpoint is invalid.",
+                retryable=False,
+            ) from exc
+        boundary = (
+            context.audio_start_time
+            + next_start
+            + settings.audio_segment_overlap_seconds / 2
+        )
+        if not math.isfinite(boundary):
+            raise MediaProcessingError(
+                "audio_checkpoint_invalid",
+                "The saved audio segment checkpoint is invalid.",
+                retryable=False,
+            )
+        # Keep the trailing chunk and next-seam chunks provisional.
+        chunks = [
+            chunk
+            for chunk in chunks[:-1]
+            if chunk["end_time"] < boundary
+        ]
+    await _index_evidence_items(context, ChunkType.TRANSCRIPT, chunks)
 
 
 async def _chunk_transcript(context: JobContext) -> dict[str, Any]:

@@ -3,17 +3,33 @@
 ## Current evidence
 
 No live-provider quality, latency, throughput, or quota measurements have been
-collected. This checkout has no `.env` or Gemini API key, and the operator has
-not supplied account- and region-specific eligibility confirmation. No user
-content has been sent to an external provider during these checks. Mocked
-provider tests are software tests, not retrieval, transcription, or answer
-quality results.
+collected. An ignored `.env` file is present, but its variable names contain no
+`GEMINI_API_KEY`; account- and region-specific eligibility has not been
+confirmed. No user content has been sent to an external provider during these
+checks. Mocked provider tests are software tests, not retrieval, transcription,
+or answer quality results.
 
 The automated suite exercises upload validation and exact-byte deduplication,
 concurrent duplicate handling, durable jobs, branch-failure isolation, shared
 index verification, video-scoped vector/FTS/RRF retrieval, generation parsing
 and citations, quota classification, consent gates, and browser behavior for
 answer rendering and timestamp seeking.
+
+## Offline fixture measurement
+
+The PostgreSQL hybrid-retrieval integration fixture labels two relevant chunks
+(one transcript and one visual) for a synthetic query. With a deterministic
+test embedding provider, both in-scope references were retrieved in the top
+10: fixture Recall@10 = **2/2 (1.00)**. This confirms the tested filter/fusion
+path for that synthetic fixture only; it is not representative of real-video
+retrieval quality and does not measure embedding quality or latency.
+
+The synthetic multimodal ingestion integration fixture also reaches `READY`
+with both evidence types indexed, preserves its injected audio offset
+(2.1–2.8 seconds) and visual frame timestamp (0.5 seconds), and observes two
+simultaneous mocked provider calls. These are pipeline, timestamp, and
+concurrency contract checks using fake AI providers, not transcription or
+vision accuracy measurements.
 
 ## Required live evaluation before release
 
