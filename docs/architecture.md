@@ -77,18 +77,18 @@ At question time: query embedding → vector search and keyword search in parall
 | Media inspection | FFprobe |
 | Media extraction | FFmpeg |
 | Scene detection | PySceneDetect |
-| Transcription | Provider adapter; Gemini is a candidate |
+| Transcription | Verified Gemini adapter through Interactions and Files APIs |
 | Vision | Gemini 3.8 Flash (`gemini-3.8-flash`), Interactions API |
-| Embeddings | Online embedding model; Gemini embedding model is a candidate |
-| Answer generation | Online LLM; Gemini Flash is a candidate |
+| Embeddings | Gemini `gemini-embedding-001`, text-only, 768-dimensional active index |
+| Answer generation | Gemini 3.8 Flash (`gemini-3.8-flash`), stateless Interactions API |
 | Testing | pytest + Playwright |
 | Local infrastructure | Docker Compose |
 
-**Provider IDs and availability are verified per adapter and may change.** The visual adapter uses the documented `gemini-3.8-flash` image input on the Interactions API with stateless requests. Google's model documentation currently lists a free standard tier, but quotas are account-specific and not guaranteed. Unpaid-tier content may be used to improve Google products and human-reviewed; the terms require 18+ and professional/business use and prohibit consumer-use apps or apps directed to minors. See the [model documentation](https://ai.google.dev/gemini-api/docs/models/gemini-3.8-flash), [image understanding guide](https://ai.google.dev/gemini-api/docs/image-understanding), [Interactions API](https://ai.google.dev/gemini-api/docs/interactions), and [terms](https://ai.google.dev/gemini-api/terms). Recheck official documentation before live use or changing model IDs. Do not code against guessed capabilities or quota values.
+**Provider IDs and availability are verified per adapter and may change.** The vision and generation adapters use documented `gemini-3.8-flash` input/output through stateless Interactions requests (`store: false`); generation uses structured JSON output. Google lists a free Standard tier for the model, with a documented 1,048,576-token input limit and 65,536-token output limit. Account-specific free quotas and rate limits are not guaranteed. Embeddings use the text-only `gemini-embedding-001` model via `batchEmbedContents`, with a configured 768-dimensional index and conservative application input/batch bounds. Unpaid-tier content and responses may be used to improve Google products and human-reviewed. Terms require an 18+ operator and professional/business use, prohibit consumer-use apps or apps directed to minors, and require paid services for API clients available to users in the EEA, UK, or Switzerland. Paid services remain prohibited by this project, so unpaid inference must be disabled in those regions. See the [embedding guide](https://ai.google.dev/gemini-api/docs/embeddings), [vision/generation model documentation](https://ai.google.dev/gemini-api/docs/models/gemini-3.8-flash), [image understanding guide](https://ai.google.dev/gemini-api/docs/image-understanding), [structured output](https://ai.google.dev/gemini-api/docs/structured-output), [Interactions API](https://ai.google.dev/gemini-api/docs/interactions), [rate limits](https://ai.google.dev/gemini-api/docs/rate-limits), and [terms](https://ai.google.dev/gemini-api/terms). Recheck official documentation before live use or changing model IDs. Do not code against guessed capabilities or quota values.
 
 ### Provider abstraction
 
-Keep provider-specific calls behind four interfaces: TranscriptionProvider, VisionProvider, EmbeddingProvider, and GenerationProvider. A Gemini adapter may implement them after free-tier capabilities and terms are verified. The pipeline must not be coupled to one vendor or silently switch to paid models.
+Keep provider-specific calls behind four interfaces: TranscriptionProvider, VisionProvider, EmbeddingProvider, and GenerationProvider. The current Gemini adapters implement these verified capabilities behind their interfaces. The pipeline must not be coupled to one vendor or silently switch to paid models.
 
 ## 5. Upload, validation, and local storage
 
@@ -247,7 +247,8 @@ Do not wait for both entire branches to finish before starting all indexing.
 - While later frame batches are being analysed, earlier visual descriptions can be embedded and stored.
 - A shared indexing stage accepts completed evidence from both branches.
 - Batch embedding requests and database writes.
-- Use bounded concurrency to respect free quotas and local laptop capacity.
+- Use a process-shared PostgreSQL advisory lock and configurable request spacing
+  for embedding and generation calls without claiming an account's free quota.
 - Mark the video READY only after all required audio and visual stages, embeddings, full-text records, and consistency checks are complete.
 - A future partial-search feature must clearly label results as partial; never report a partially indexed asset as READY.
 
@@ -268,7 +269,7 @@ Free-tier availability and limits can change. Treat them as explicit runtime con
 
 When quota is exhausted, pause safely and resume later. Throughput is subordinate to the free-tier limit.
 
-**Privacy note:** Online inference means audio, transcript text, selected frames, OCR, or other submitted content may leave the laptop and be processed by an external provider. Review provider data-use, retention, and model-improvement terms before uploading confidential recordings.
+**Privacy note:** Online inference means audio, transcript text, selected frames, OCR, questions, retrieved evidence, and generated answers may leave the laptop and be processed by an external provider. The Interactions API requests use `store: false`, but unpaid-service terms still allow Google to use inputs and outputs to improve products and permit human review. Review current terms before use; do not send sensitive, confidential, or personal content.
 
 ## 10. Shared indexing and chunk representation
 
@@ -548,11 +549,11 @@ Create files incrementally as each phase is implemented; do not generate a huge 
 | 4 | Media preparation and audio: FFmpeg, bounded segments, verified online transcription, original-timeline timestamps, transcript artifacts | Timestamped audio evidence is checkpointed locally; asset stays non-READY |
 | 5 | Visual pipeline: scene detection, frame sampling, dedup, OCR, online vision | Timestamped visual evidence is checkpointed locally; audio and visual branches run concurrently; asset stays non-READY |
 | 6 | Shared indexing: normalization, online embeddings, batching, pgvector, FTS | Both modalities are indexed and verified |
-| 7 | Hybrid retrieval: vector search, keyword search, RRF | Relevant evidence is retrieved for test questions |
-| 8 | Grounded Q&A: context assembly, generation, evidence, abstention | Answers cite supported evidence and timestamps |
-| 9 | Complete UI: library, player, chat, progress, errors | End-to-end user flow works |
-| 10 | Evaluation: ingestion, retrieval, timestamp, latency benchmarks | Metrics are measured and documented |
-| 11 | Hardening: security, recovery, resource limits, docs, failure tests | Common failures are handled and documented |
+| 7 | Hybrid retrieval: vector search, keyword search, RRF | Implemented: video-scoped parallel retrieval, active-index filtering, deterministic RRF, and tests |
+| 8 | Grounded Q&A: context assembly, generation, evidence, abstention | Implemented: stateless structured generation, citation validation, abstention, and consent/region gates |
+| 9 | Complete UI: library, player, chat, progress, errors | Implemented: API-backed library/detail/player, real job progress, Q&A, timestamp seeking, and Playwright journeys |
+| 10 | Evaluation: ingestion, retrieval, timestamp, latency benchmarks | Evaluation protocol documented; live measurements blocked on eligible provider configuration and consented evaluation videos |
+| 11 | Hardening: security, recovery, resource limits, docs, failure tests | In progress; backend recovery/retry tests, backup/restore runbook, and Playwright checks added; an isolated restore drill remains |
 
 Earlier planning estimate: approximately 28–42 days at 3–4 focused hours/day for an interview-ready build; a narrower prototype may take 2–3 weeks. This is a planning estimate, not a commitment.
 
@@ -560,8 +561,8 @@ Earlier planning estimate: approximately 28–42 days at 3–4 focused hours/day
 
 These are not final decisions and should be resolved with tests or official provider documentation:
 
-- Exact free online provider/model IDs for transcription, vision, embeddings, and generation.
-- Current free-tier quotas, rate limits, media limits, retention, and data-use terms.
+- Current account-specific free quotas and rate limits, media limits, retention, and data-use terms must be rechecked before live use.
+- Google unpaid inference is not eligible for API clients available to users in the EEA, UK, or Switzerland; this project cannot switch to paid access.
 - Final hard upload cap and supported formats.
 - Frame sampling policy and maximum vision requests per video.
 - Transcript chunk size and overlap.

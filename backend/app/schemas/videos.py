@@ -1,10 +1,12 @@
 import re
+from datetime import datetime
 from typing import Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.models.enums import LifecycleStatus
+from app.schemas.jobs import JobProgressResponse
 
 _SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 
@@ -57,6 +59,32 @@ class UploadResponse(BaseModel):
         "reuse_paused_quota",
         "retry_available",
     ]
+
+
+class VideoLibraryItem(BaseModel):
+    id: UUID
+    original_filename: str
+    file_size_bytes: int
+    duration_seconds: float
+    status: LifecycleStatus
+    created_at: datetime
+    updated_at: datetime
+
+
+class VideoLibraryResponse(BaseModel):
+    videos: list[VideoLibraryItem]
+    limit: int
+    offset: int
+
+
+class VideoDetailResponse(VideoLibraryItem):
+    mime_type: str
+    video_codec: str
+    audio_codec: str | None
+    width: int
+    height: int
+    external_processing_consent: bool
+    job: JobProgressResponse | None
 
 
 class ErrorPayload(BaseModel):

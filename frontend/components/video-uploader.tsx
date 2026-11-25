@@ -52,7 +52,11 @@ function formatBytes(bytes: number): string {
   return `${(bytes / 1_000_000).toFixed(1)} MB`;
 }
 
-export default function VideoUploader() {
+export default function VideoUploader({
+  onAssetAvailable,
+}: {
+  onAssetAvailable?: (assetId: string) => void;
+}) {
   const [file, setFile] = useState<File | null>(null);
   const [phase, setPhase] = useState<UploadPhase>("idle");
   const [progress, setProgress] = useState(0);
@@ -151,6 +155,9 @@ export default function VideoUploader() {
         }
         setMessage(duplicateMessage(result.duplicate_action));
         setPhase("duplicate");
+        if (result.asset_id) {
+          onAssetAvailable?.(result.asset_id);
+        }
         return;
       }
 
@@ -170,6 +177,7 @@ export default function VideoUploader() {
         setProgress,
       );
       setReceipt(uploaded);
+      onAssetAvailable?.(uploaded.asset_id);
       setMessage(
         uploaded.duplicate
           ? duplicateMessage(uploaded.duplicate_action)
@@ -260,13 +268,15 @@ export default function VideoUploader() {
             onChange={(event) => setConsentAccepted(event.currentTarget.checked)}
           />
           <span>
-            I agree to send audio, transcripts, selected frames, and OCR text to
-            the configured free-tier AI provider. Unpaid Gemini content may be
-            used to improve Google products and may be human-reviewed. I will not
-            submit sensitive, confidential, or personal content.
-            {" "}Gemini API use requires an operator aged 18 or older and a
-            professional or business purpose; it is not for consumer-use apps
-            or apps directed to minors.
+            I agree that audio, transcripts, selected frames, OCR, my questions,
+            and retrieved video evidence may be sent to the configured unpaid
+            AI provider for processing. Gemini may use submissions and answers
+            to improve products, and human reviewers may process them. I will
+            not submit sensitive, confidential, or personal content. Gemini use
+            requires an operator aged 18+ and a professional or business
+            purpose, not consumer use or applications directed to minors.
+            Unpaid access is not available for API clients made available to
+            users in the EEA, UK, or Switzerland.
           </span>
         </label>
         <button className="upload-button" type="submit" disabled={!file || busy}>

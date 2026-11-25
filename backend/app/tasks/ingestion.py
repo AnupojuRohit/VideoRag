@@ -1,9 +1,12 @@
 import asyncio
 import logging
+from collections.abc import Coroutine
+from typing import Any, TypeVar
 from uuid import UUID
 
 from app.celery_app import celery_app
 from app.core.config import get_settings
+from app.db.session import engine
 from app.services.ingestion.pipeline import (
     RetryableJobError,
     process_ingestion_job,
@@ -11,6 +14,20 @@ from app.services.ingestion.pipeline import (
 )
 
 logger = logging.getLogger(__name__)
+Result = TypeVar("Result")
+
+
+async def _run_with_database_lifecycle(
+    coroutine: Coroutine[Any, Any, Result],
+) -> Result:
+    try:
+        return await coroutine
+    finally:
+        await engine.dispose()
+
+
+def run_async_task(coroutine: Coroutine[Any, Any, Result]) -> Result:
+    return asyncio.run(_run_with_database_lifecycle(coroutine))
 
 
 @celery_app.task(
@@ -28,7 +45,7 @@ def process_video(self, job_id: str) -> None:
         raise ValueError("Invalid processing job identifier") from exc
 
     try:
-        asyncio.run(
+        run_async_task(
             process_ingestion_job(
                 parsed_job_id,
                 retry_count=self.request.retries,
@@ -45,4 +62,4 @@ def process_video(self, job_id: str) -> None:
 
 @celery_app.task(name="app.tasks.ingestion.reconcile_processing_jobs")
 def reconcile_processing_jobs() -> int:
-    return asyncio.run(reconcile_jobs_async())
+    return run_async_task(reconcile_jobs_async())

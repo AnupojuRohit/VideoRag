@@ -1,1 +1,1 @@
-EXTERNAL_PROCESSING_CONSENT_VERSION = "gemini-free-tier-image-and-use-terms-v2"
+EXTERNAL_PROCESSING_CONSENT_VERSION = "gemini-unpaid-inference-terms-v3"

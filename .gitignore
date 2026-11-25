@@ -17,6 +17,8 @@ node_modules/
 .next/
 out/
 frontend/coverage/
+frontend/playwright-report/
+frontend/test-results/
 
 # Local media and generated artifacts
 data/*

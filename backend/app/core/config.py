@@ -59,11 +59,20 @@ class Settings(BaseSettings):
     gemini_api_key: SecretStr | None = None
     gemini_unpaid_api_acknowledged: bool = False
     gemini_api_terms_acknowledged: bool = False
+    gemini_region_eligible_acknowledged: bool = False
     embedding_model_id: str | None = "gemini-embedding-001"
     embedding_model_version: str | None = "stable"
     embedding_dimension: int | None = Field(default=768, gt=0)
     embedding_batch_size: int = Field(default=4, gt=0, le=16)
+    gemini_min_request_interval_seconds: float = Field(
+        default=1,
+        ge=0,
+        le=60,
+        allow_inf_nan=False,
+    )
     embedding_request_timeout_seconds: int = Field(default=120, gt=0)
+    generation_request_timeout_seconds: int = Field(default=120, gt=0)
+    generation_max_output_tokens: int = Field(default=512, gt=0, le=65_536)
 
     @model_validator(mode="after")
     def validate_embedding_configuration(self) -> "Settings":
@@ -79,17 +88,26 @@ class Settings(BaseSettings):
                 "Embedding model ID, version, and dimension must be set together"
             )
         if (
+            self.embedding_model_id == "gemini-embedding-001"
+            and self.embedding_dimension not in {768, 1536, 3072}
+        ):
+            raise ValueError(
+                "gemini-embedding-001 output dimensions must be 768, 1536, or 3072"
+            )
+        if (
             self.gemini_api_key is not None
             and self.gemini_api_key.get_secret_value().strip()
             and (
                 not self.gemini_unpaid_api_acknowledged
                 or not self.gemini_api_terms_acknowledged
+                or not self.gemini_region_eligible_acknowledged
             )
         ):
             raise ValueError(
                 "Gemini API use requires acknowledgement of the unpaid-tier data "
                 "terms, age and professional-use requirements, and a project "
-                "without active billing"
+                "without active billing, and confirmation that unpaid use is "
+                "permitted in the deployment region"
             )
         if self.audio_segment_overlap_seconds >= self.audio_segment_seconds:
             raise ValueError(

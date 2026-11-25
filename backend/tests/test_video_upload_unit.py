@@ -72,10 +72,17 @@ def test_embedding_settings_require_model_version_and_dimension_together() -> No
         embedding_model_version="v1",
         embedding_dimension=768,
     )
-    assert settings.embedding_dimension == 3
+    assert settings.embedding_dimension == 768
+
+    with pytest.raises(ValidationError):
+        Settings(
+            embedding_model_id="gemini-embedding-001",
+            embedding_model_version="stable",
+            embedding_dimension=3,
+        )
 
 
-def test_gemini_key_requires_unpaid_tier_data_acknowledgement() -> None:
+def test_gemini_key_requires_unpaid_tier_terms_and_region_acknowledgements() -> None:
     with pytest.raises(ValidationError):
         Settings(gemini_api_key="test-only-key")
 
@@ -85,10 +92,18 @@ def test_gemini_key_requires_unpaid_tier_data_acknowledgement() -> None:
             gemini_unpaid_api_acknowledged=True,
         )
 
+    with pytest.raises(ValidationError):
+        Settings(
+            gemini_api_key="test-only-key",
+            gemini_unpaid_api_acknowledged=True,
+            gemini_api_terms_acknowledged=True,
+        )
+
     settings = Settings(
         gemini_api_key="test-only-key",
         gemini_unpaid_api_acknowledged=True,
         gemini_api_terms_acknowledged=True,
+        gemini_region_eligible_acknowledged=True,
     )
     assert settings.gemini_api_key is not None
 

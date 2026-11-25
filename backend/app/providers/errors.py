@@ -37,3 +37,7 @@ class VisionProviderError(ProviderError):
 
 class EmbeddingProviderError(ProviderError):
     pass
+
+
+class GenerationProviderError(ProviderError):
+    pass

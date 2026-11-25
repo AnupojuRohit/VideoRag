@@ -56,6 +56,49 @@ export type JobProgress = {
   stages: StageProgress[];
 };
 
+export type VideoLibraryItem = {
+  id: string;
+  original_filename: string;
+  file_size_bytes: number;
+  duration_seconds: number;
+  status: string;
+  created_at: string;
+  updated_at: string;
+};
+
+export type VideoLibrary = {
+  videos: VideoLibraryItem[];
+  limit: number;
+  offset: number;
+};
+
+export type VideoDetail = VideoLibraryItem & {
+  mime_type: string;
+  video_codec: string;
+  audio_codec: string | null;
+  width: number;
+  height: number;
+  external_processing_consent: boolean;
+  job: JobProgress | null;
+};
+
+export type AnswerCitation = {
+  citation_id: string;
+  chunk_id: string;
+  chunk_type: "TRANSCRIPT" | "VISUAL";
+  content: string;
+  start_time: number;
+  end_time: number;
+};
+
+export type VideoAnswer = {
+  video_id: string;
+  answer: string;
+  abstained: boolean;
+  inference: boolean;
+  citations: AnswerCitation[];
+};
+
 type ApiErrorResponse = {
   error?: {
     message?: string;
@@ -185,6 +228,40 @@ export async function getJobProgress(jobId: string): Promise<JobProgress> {
     cache: "no-store",
   });
   return parseResponse<JobProgress>(response);
+}
+
+export async function getVideoLibrary(): Promise<VideoLibrary> {
+  const response = await fetch(`${API_URL}/api/v1/videos?limit=100`, {
+    cache: "no-store",
+  });
+  return parseResponse<VideoLibrary>(response);
+}
+
+export async function getVideoDetail(assetId: string): Promise<VideoDetail> {
+  const response = await fetch(`${API_URL}/api/v1/videos/${assetId}`, {
+    cache: "no-store",
+  });
+  return parseResponse<VideoDetail>(response);
+}
+
+export async function askVideoQuestion(
+  assetId: string,
+  question: string,
+): Promise<VideoAnswer> {
+  const response = await fetch(
+    `${API_URL}/api/v1/videos/${assetId}/answer`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ question }),
+      cache: "no-store",
+    },
+  );
+  return parseResponse<VideoAnswer>(response);
+}
+
+export function getVideoMediaUrl(assetId: string): string {
+  return `${API_URL}/api/v1/videos/${assetId}/media`;
 }
 
 async function updateJob(

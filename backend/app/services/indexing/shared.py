@@ -1,26 +1,31 @@
+import asyncio
 import json
+import logging
 import math
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import func, select, text
+from sqlalchemy import delete, func, select, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from app.core.config import get_settings
-from app.db.session import SessionLocal
+from app.db.session import SessionLocal, engine
 from app.models.embedding_index_version import EmbeddingIndexVersion
 from app.models.enums import ChunkType
 from app.models.provider_usage_event import ProviderUsageEvent
 from app.models.video_chunk import VideoChunk
-from app.providers.embedding import EmbeddingProvider, EmbeddingTask
-from app.providers.errors import EmbeddingProviderError
+from app.providers.embedding import EmbeddingProvider
+from app.providers.errors import EmbeddingProviderError, ProviderError
 from app.providers.gemini_embedding import create_embedding_provider
 from app.providers.transcription import ProviderUsage
 from app.services.media.audio import MediaProcessingError
 
 _MAX_CHUNK_BYTES = 1500
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -125,6 +130,13 @@ def normalize_evidence(
                 part_ref = f"{source_ref}:part:{index:04d}"
             else:
                 part_ref = source_ref
+            if part_ref in seen_refs:
+                raise MediaProcessingError(
+                    "evidence_source_ref_duplicate",
+                    "The evidence batch contains duplicate source references.",
+                    retryable=False,
+                )
+            seen_refs.add(part_ref)
             normalized.append(
                 SearchableChunk(
                     chunk_type=chunk_type,
@@ -135,17 +147,13 @@ def normalize_evidence(
                     metadata=part_metadata,
                 )
             )
-            if part_ref in seen_refs:
-                raise MediaProcessingError(
-                    "evidence_source_ref_duplicate",
-                    "The evidence batch contains duplicate source references.",
-                    retryable=False,
-                )
-            seen_refs.add(part_ref)
     return normalized
 
 
-async def _active_index_version() -> EmbeddingIndexVersion:
+async def _active_index_version(
+    *,
+    create_if_missing: bool = True,
+) -> EmbeddingIndexVersion | None:
     settings = get_settings()
     if (
         not settings.embedding_model_id
@@ -182,6 +190,8 @@ async def _active_index_version() -> EmbeddingIndexVersion:
                         retryable=False,
                     )
                 return version
+            if not create_if_missing:
+                return None
             version = EmbeddingIndexVersion(
                 model_id=settings.embedding_model_id,
                 model_version=settings.embedding_model_version,
@@ -193,29 +203,72 @@ async def _active_index_version() -> EmbeddingIndexVersion:
             return version
 
 
-async def _persist_usage(
+async def persist_provider_usage(
     job_id: UUID,
     stage_name: str,
     usage: ProviderUsage,
 ) -> None:
-    async with SessionLocal() as session:
-        async with session.begin():
-            session.add(
-                ProviderUsageEvent(
-                    job_id=job_id,
-                    stage_name=stage_name,
-                    provider=usage.provider,
-                    model_id=usage.model_id,
-                    operation=usage.operation,
-                    status_code=usage.status_code,
-                    latency_ms=usage.latency_ms,
-                    input_bytes=usage.input_bytes,
-                    input_tokens=usage.input_tokens,
-                    output_tokens=usage.output_tokens,
-                    request_id=usage.request_id,
-                    error_code=usage.cleanup_error,
+    try:
+        async with SessionLocal() as session:
+            async with session.begin():
+                session.add(
+                    ProviderUsageEvent(
+                        job_id=job_id,
+                        stage_name=stage_name,
+                        provider=usage.provider,
+                        model_id=usage.model_id,
+                        operation=usage.operation,
+                        status_code=usage.status_code,
+                        latency_ms=usage.latency_ms,
+                        input_bytes=usage.input_bytes,
+                        input_tokens=usage.input_tokens,
+                        output_tokens=usage.output_tokens,
+                        request_id=usage.request_id,
+                        error_code=usage.cleanup_error,
+                    )
                 )
-            )
+    except SQLAlchemyError as exc:
+        raise MediaProcessingError(
+            "provider_usage_write_failed",
+            "Provider usage could not be recorded.",
+            retryable=True,
+            transient=True,
+        ) from exc
+
+
+async def persist_provider_error(
+    job_id: UUID,
+    error: ProviderError,
+    input_bytes: int,
+    *,
+    stage_name: str,
+    model_id: str,
+    operation: str,
+) -> None:
+    try:
+        async with SessionLocal() as session:
+            async with session.begin():
+                session.add(
+                    ProviderUsageEvent(
+                        job_id=job_id,
+                        stage_name=stage_name,
+                        provider="gemini",
+                        model_id=model_id,
+                        operation=operation,
+                        status_code=error.status_code,
+                        latency_ms=error.latency_ms or 0,
+                        input_bytes=input_bytes,
+                        request_id=error.request_id,
+                        error_code=error.code,
+                    )
+                )
+    except SQLAlchemyError as exc:
+        raise MediaProcessingError(
+            "provider_usage_write_failed",
+            "Provider usage could not be recorded.",
+            retryable=True,
+            transient=True,
+        ) from exc
 
 
 async def _upsert_chunks(
@@ -270,6 +323,35 @@ async def _upsert_chunks(
             retryable=True,
             transient=True,
         ) from exc
+
+
+@asynccontextmanager
+async def gemini_provider_lock():
+    connection = await engine.connect()
+    acquired = False
+    try:
+        await connection.execute(
+            text(
+                "SELECT pg_advisory_lock("
+                "hashtextextended('videorag-gemini-online-model-requests', 0))"
+            )
+        )
+        await connection.commit()
+        acquired = True
+        yield
+    finally:
+        if acquired:
+            try:
+                await connection.execute(
+                    text(
+                        "SELECT pg_advisory_unlock("
+                        "hashtextextended('videorag-gemini-online-model-requests', 0))"
+                    )
+                )
+                await connection.commit()
+            except SQLAlchemyError:
+                logger.exception("Could not explicitly release Gemini provider lock")
+        await connection.close()
 
 
 async def _pending_chunks(
@@ -328,6 +410,32 @@ async def _pending_chunks(
     ]
 
 
+async def pace_gemini_request(model_id: str) -> None:
+    interval = get_settings().gemini_min_request_interval_seconds
+    if interval == 0:
+        return
+    try:
+        async with SessionLocal() as session:
+            last_request = await session.scalar(
+                select(func.max(ProviderUsageEvent.created_at)).where(
+                    ProviderUsageEvent.provider == "gemini",
+                    ProviderUsageEvent.model_id == model_id,
+                )
+            )
+    except SQLAlchemyError as exc:
+        raise MediaProcessingError(
+            "provider_request_pacing_unavailable",
+            "Provider request pacing could not be checked.",
+            retryable=True,
+            transient=True,
+        ) from exc
+    if last_request is not None:
+        elapsed = (datetime.now(timezone.utc) - last_request).total_seconds()
+        delay = interval - elapsed
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+
 async def index_evidence(
     job_id: UUID,
     video_id: UUID,
@@ -340,8 +448,6 @@ async def index_evidence(
     if not all_chunks:
         return 0
     settings = get_settings()
-    if provider is None:
-        provider = create_embedding_provider()
     try:
         version = await _active_index_version()
     except SQLAlchemyError as exc:
@@ -351,32 +457,156 @@ async def index_evidence(
             retryable=True,
             transient=True,
         ) from exc
+    if version is None:
+        raise MediaProcessingError(
+            "embedding_index_version_unavailable",
+            "The active embedding index could not be loaded.",
+            retryable=True,
+            transient=True,
+        )
     chunks = await _pending_chunks(video_id, version.id, all_chunks)
     if not chunks:
         return 0
-    for offset in range(0, len(chunks), settings.embedding_batch_size):
-        batch = chunks[offset : offset + settings.embedding_batch_size]
-        try:
-            result = await provider.embed_texts(
-                [chunk.content for chunk in batch],
-                "RETRIEVAL_DOCUMENT",
-            )
-        except EmbeddingProviderError:
-            raise
-        if len(result.vectors) != len(batch):
-            raise EmbeddingProviderError(
-                "provider_response_invalid",
-                "The embedding provider returned an incomplete batch.",
-                retryable=False,
-            )
-        await _persist_usage(job_id, "embeddings", result.usage)
-        await _upsert_chunks(
-            video_id,
-            version.id,
-            batch,
-            result.vectors,
-        )
+    try:
+        async with gemini_provider_lock():
+            active_provider = provider or create_embedding_provider()
+            for offset in range(0, len(chunks), settings.embedding_batch_size):
+                batch = chunks[offset : offset + settings.embedding_batch_size]
+                await pace_gemini_request(settings.embedding_model_id or "")
+                texts = [chunk.content for chunk in batch]
+                try:
+                    result = await active_provider.embed_texts(
+                        texts,
+                        "RETRIEVAL_DOCUMENT",
+                    )
+                except EmbeddingProviderError as exc:
+                    await persist_provider_error(
+                        job_id,
+                        exc,
+                        sum(len(value.encode("utf-8")) for value in texts),
+                        stage_name="embeddings",
+                        model_id=settings.embedding_model_id or "unknown",
+                        operation="embedding",
+                    )
+                    raise
+                if len(result.vectors) != len(batch):
+                    raise EmbeddingProviderError(
+                        "provider_response_invalid",
+                        "The embedding provider returned an incomplete batch.",
+                        retryable=False,
+                    )
+                await persist_provider_usage(job_id, "embeddings", result.usage)
+                await _upsert_chunks(
+                    video_id,
+                    version.id,
+                    batch,
+                    result.vectors,
+                )
+    except SQLAlchemyError as exc:
+        raise MediaProcessingError(
+            "embedding_provider_lock_failed",
+            "The embedding request could not be coordinated safely.",
+            retryable=True,
+            transient=True,
+        ) from exc
     return len(chunks)
+
+
+async def embed_query(
+    job_id: UUID,
+    query: str,
+    *,
+    provider: EmbeddingProvider | None = None,
+) -> tuple[EmbeddingIndexVersion, list[float]]:
+    if not query.strip() or len(query.encode("utf-8")) > _MAX_CHUNK_BYTES:
+        raise MediaProcessingError(
+            "query_input_invalid",
+            "The search question is empty or exceeds the supported input size.",
+            retryable=False,
+        )
+    settings = get_settings()
+    try:
+        version = await _active_index_version(create_if_missing=False)
+    except SQLAlchemyError as exc:
+        raise MediaProcessingError(
+            "embedding_index_version_unavailable",
+            "The active embedding index could not be loaded.",
+            retryable=True,
+            transient=True,
+        ) from exc
+    if version is None:
+        raise MediaProcessingError(
+            "embedding_index_not_available",
+            "No searchable embedding index is available yet.",
+            retryable=False,
+        )
+
+    try:
+        async with gemini_provider_lock():
+            active_provider = provider or create_embedding_provider()
+            await pace_gemini_request(settings.embedding_model_id or "")
+            try:
+                result = await active_provider.embed_texts(
+                    [query],
+                    "RETRIEVAL_QUERY",
+                )
+            except EmbeddingProviderError as exc:
+                await persist_provider_error(
+                    job_id,
+                    exc,
+                    len(query.encode("utf-8")),
+                    stage_name="retrieval",
+                    model_id=settings.embedding_model_id or "unknown",
+                    operation="embedding",
+                )
+                raise
+            if (
+                len(result.vectors) != 1
+                or len(result.vectors[0]) != version.dimension
+                or any(not math.isfinite(value) for value in result.vectors[0])
+            ):
+                raise EmbeddingProviderError(
+                    "provider_response_invalid",
+                    "The embedding provider returned a query vector with an invalid shape.",
+                    retryable=False,
+                )
+            await persist_provider_usage(job_id, "retrieval", result.usage)
+            return version, result.vectors[0]
+    except SQLAlchemyError as exc:
+        raise MediaProcessingError(
+            "embedding_provider_lock_failed",
+            "The embedding request could not be coordinated safely.",
+            retryable=True,
+            transient=True,
+        ) from exc
+
+
+async def prune_stale_evidence(
+    video_id: UUID,
+    chunk_type: ChunkType,
+    evidence_items: list[dict[str, Any]],
+) -> None:
+    expected = normalize_evidence(evidence_items, chunk_type)
+    expected_refs = {chunk.source_ref for chunk in expected}
+    try:
+        async with SessionLocal() as session:
+            async with session.begin():
+                statement = delete(VideoChunk).where(
+                    VideoChunk.video_id == video_id,
+                    VideoChunk.chunk_type == chunk_type,
+                )
+                if expected_refs:
+                    statement = statement.where(
+                        VideoChunk.source_ref.not_in(expected_refs)
+                    )
+                await session.execute(statement)
+    except SQLAlchemyError as exc:
+        raise MediaProcessingError(
+            "stale_evidence_cleanup_failed",
+            "Obsolete evidence could not be removed from the search index.",
+            retryable=True,
+            transient=True,
+        ) from exc
 
 
 async def verify_video_index(
@@ -393,7 +623,7 @@ async def verify_video_index(
                         VideoChunk.chunk_type,
                         VideoChunk.embedding_index_version_id,
                         func.vector_dims(VideoChunk.embedding),
-                        func.numnode(VideoChunk.search_vector),
+                        func.length(VideoChunk.search_vector),
                     ).where(VideoChunk.video_id == video_id)
                 )
             ).all()
@@ -404,6 +634,13 @@ async def verify_video_index(
             retryable=True,
             transient=True,
         ) from exc
+    if version is None:
+        raise MediaProcessingError(
+            "embedding_index_version_unavailable",
+            "The active embedding index could not be loaded.",
+            retryable=True,
+            transient=True,
+        )
 
     expected_keys = {
         (chunk.source_ref, chunk.chunk_type)

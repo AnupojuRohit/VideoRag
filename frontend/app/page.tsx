@@ -1,5 +1,5 @@
 import ApiStatus from "@/components/api-status";
-import VideoUploader from "@/components/video-uploader";
+import VideoWorkspace from "@/components/video-workspace";
 
 export default function Home() {
   return (
@@ -13,16 +13,7 @@ export default function Home() {
         </p>
         <ApiStatus />
       </section>
-      <VideoUploader />
-      <section className="milestone" aria-labelledby="milestone-title">
-        <h2 id="milestone-title">What happens next</h2>
-        <p>
-          The local API validates and saves uploads, and exact-byte duplicates
-          reuse the original asset. Background transcription and visual
-          processing are not enabled yet; uploaded videos remain in the
-          <code> UPLOADED </code> state.
-        </p>
-      </section>
+      <VideoWorkspace />
     </main>
   );
 }

@@ -18,7 +18,12 @@ from sqlalchemy.exc import SQLAlchemyError
 from app.core.config import get_settings
 from app.core.privacy import EXTERNAL_PROCESSING_CONSENT_VERSION
 from app.db.session import SessionLocal, engine
-from app.models.enums import LifecycleStatus, StageStatus, PIPELINE_STAGES
+from app.models.enums import (
+    ChunkType,
+    LifecycleStatus,
+    PIPELINE_STAGES,
+    StageStatus,
+)
 from app.models.processing_job import ProcessingJob
 from app.models.processing_stage import ProcessingStage
 from app.models.provider_usage_event import ProviderUsageEvent
@@ -41,6 +46,13 @@ from app.providers.vision import VisionProvider
 from app.services.jobs.orchestration import (
     mark_job_failed,
     pause_job_for_quota,
+)
+from app.services.indexing.shared import (
+    SearchableChunk,
+    index_evidence,
+    normalize_evidence,
+    prune_stale_evidence,
+    verify_video_index,
 )
 from app.services.media.audio import (
     AudioSegment,
@@ -383,20 +395,155 @@ def _segment_artifact_exists(
     ).is_file()
 
 
-async def _finish_pipeline_at_phase_boundary(job_id: UUID) -> None:
-    async with SessionLocal() as session:
-        async with session.begin():
-            job = await session.scalar(
-                select(ProcessingJob)
-                .where(ProcessingJob.id == job_id)
-                .with_for_update()
+async def _set_lifecycle_status(
+    job_id: UUID,
+    status: LifecycleStatus,
+) -> None:
+    now = datetime.now(timezone.utc)
+    try:
+        async with SessionLocal() as session:
+            async with session.begin():
+                job = await session.scalar(
+                    select(ProcessingJob)
+                    .where(ProcessingJob.id == job_id)
+                    .with_for_update()
+                )
+                if job is None or job.status == LifecycleStatus.CANCELLED:
+                    return
+                asset = await session.scalar(
+                    select(VideoAsset)
+                    .where(VideoAsset.id == job.video_id)
+                    .with_for_update()
+                )
+                if asset is None:
+                    raise MediaProcessingError(
+                        "video_asset_missing",
+                        "The video asset for this job no longer exists.",
+                        retryable=False,
+                    )
+                job.status = status
+                job.heartbeat_at = now
+                job.lease_expires_at = now + timedelta(
+                    seconds=get_settings().job_lease_seconds
+                )
+                asset.status = status
+    except SQLAlchemyError as exc:
+        raise MediaProcessingError(
+            "job_status_update_failed",
+            "The processing status could not be updated.",
+            retryable=True,
+            transient=True,
+        ) from exc
+
+
+async def _mark_job_ready(job_id: UUID) -> None:
+    now = datetime.now(timezone.utc)
+    try:
+        async with SessionLocal() as session:
+            async with session.begin():
+                job = await session.scalar(
+                    select(ProcessingJob)
+                    .where(ProcessingJob.id == job_id)
+                    .with_for_update()
+                )
+                if job is None or job.status == LifecycleStatus.CANCELLED:
+                    return
+                statuses = (
+                    await session.scalars(
+                        select(ProcessingStage.status).where(
+                            ProcessingStage.job_id == job_id
+                        )
+                    )
+                ).all()
+                if len(statuses) != len(_STAGE_NAMES) or any(
+                    status not in {StageStatus.COMPLETED, StageStatus.SKIPPED}
+                    for status in statuses
+                ):
+                    raise MediaProcessingError(
+                        "required_processing_incomplete",
+                        "The evidence index cannot be marked ready before every required stage is complete.",
+                        retryable=True,
+                    )
+                asset = await session.scalar(
+                    select(VideoAsset)
+                    .where(VideoAsset.id == job.video_id)
+                    .with_for_update()
+                )
+                if asset is None:
+                    raise MediaProcessingError(
+                        "video_asset_missing",
+                        "The video asset for this job no longer exists.",
+                        retryable=False,
+                    )
+                job.status = LifecycleStatus.READY
+                job.current_stage = None
+                job.finished_at = now
+                job.heartbeat_at = now
+                job.lease_expires_at = None
+                job.last_enqueued_at = None
+                job.last_error = None
+                asset.status = LifecycleStatus.READY
+    except SQLAlchemyError as exc:
+        raise MediaProcessingError(
+            "job_ready_update_failed",
+            "The verified asset could not be marked ready.",
+            retryable=True,
+            transient=True,
+        ) from exc
+
+
+async def _verify_index_artifacts(context: JobContext) -> dict[str, Any]:
+    expected: list[SearchableChunk] = []
+    if context.has_audio:
+        try:
+            audio_payload = await _read_json(
+                context.work_dir / "audio" / "transcript-chunks.json"
             )
-            if job is None or job.status == LifecycleStatus.CANCELLED:
-                return
-            job.current_stage = None
-            job.lease_expires_at = None
-            job.last_enqueued_at = None
-            job.heartbeat_at = datetime.now(timezone.utc)
+        except MediaProcessingError as error:
+            raise MediaProcessingError(
+                "transcript_artifact_invalid",
+                "The saved transcript chunks are unavailable for verification.",
+                retryable=True,
+                transient=True,
+            ) from error
+        audio_items = audio_payload.get("chunks")
+        if not isinstance(audio_items, list):
+            raise MediaProcessingError(
+                "transcript_artifact_invalid",
+                "The saved transcript chunks are invalid.",
+                retryable=False,
+            )
+        expected.extend(normalize_evidence(audio_items, ChunkType.TRANSCRIPT))
+
+    try:
+        visual_payload = await _read_json(
+            context.work_dir / "visual" / "visual-evidence.json"
+        )
+    except MediaProcessingError as error:
+        raise MediaProcessingError(
+            "visual_evidence_invalid",
+            "The saved visual evidence is unavailable for verification.",
+            retryable=True,
+            transient=True,
+        ) from error
+    visual_items = visual_payload.get("evidence")
+    if not isinstance(visual_items, list):
+        raise MediaProcessingError(
+            "visual_evidence_invalid",
+            "The saved visual evidence is invalid.",
+            retryable=False,
+        )
+    expected.extend(normalize_evidence(visual_items, ChunkType.VISUAL))
+    result = await verify_video_index(context.video_id, expected)
+    return {
+        **result,
+        "audio_chunk_count": sum(
+            chunk.chunk_type == ChunkType.TRANSCRIPT for chunk in expected
+        ),
+        "visual_chunk_count": sum(
+            chunk.chunk_type == ChunkType.VISUAL for chunk in expected
+        ),
+    }
 
 
 async def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
@@ -437,55 +584,71 @@ async def _read_json(path: Path) -> dict[str, Any]:
 
 
 async def _persist_usage(job_id: UUID, stage_name: str, usage: ProviderUsage) -> None:
-    async with SessionLocal() as session:
-        async with session.begin():
-            session.add(
-                ProviderUsageEvent(
-                    job_id=job_id,
-                    stage_name=stage_name,
-                    provider=usage.provider,
-                    model_id=usage.model_id,
-                    operation=usage.operation,
-                    status_code=usage.status_code,
-                    latency_ms=usage.latency_ms,
-                    input_bytes=usage.input_bytes,
-                    input_tokens=usage.input_tokens,
-                    output_tokens=usage.output_tokens,
-                    request_id=usage.request_id,
-                    error_code=usage.cleanup_error,
+    try:
+        async with SessionLocal() as session:
+            async with session.begin():
+                session.add(
+                    ProviderUsageEvent(
+                        job_id=job_id,
+                        stage_name=stage_name,
+                        provider=usage.provider,
+                        model_id=usage.model_id,
+                        operation=usage.operation,
+                        status_code=usage.status_code,
+                        latency_ms=usage.latency_ms,
+                        input_bytes=usage.input_bytes,
+                        input_tokens=usage.input_tokens,
+                        output_tokens=usage.output_tokens,
+                        request_id=usage.request_id,
+                        error_code=usage.cleanup_error,
+                    )
                 )
-            )
+    except SQLAlchemyError as exc:
+        raise MediaProcessingError(
+            "provider_usage_write_failed",
+            "Provider usage could not be recorded.",
+            retryable=True,
+            transient=True,
+        ) from exc
 
 
 async def _persist_provider_error(
     job_id: UUID,
     stage_name: str,
-    source_path: Path,
+    source_path: Path | None,
     error: ProviderError,
     *,
     model_id: str,
     operation: str,
 ) -> None:
     try:
-        input_bytes = source_path.stat().st_size
+        input_bytes = source_path.stat().st_size if source_path is not None else None
     except OSError:
         input_bytes = None
-    async with SessionLocal() as session:
-        async with session.begin():
-            session.add(
-                ProviderUsageEvent(
-                    job_id=job_id,
-                    stage_name=stage_name,
-                    provider="gemini",
-                    model_id=model_id,
-                    operation=operation,
-                    status_code=error.status_code,
-                    latency_ms=error.latency_ms or 0,
-                    input_bytes=input_bytes,
-                    request_id=error.request_id,
-                    error_code=error.code,
+    try:
+        async with SessionLocal() as session:
+            async with session.begin():
+                session.add(
+                    ProviderUsageEvent(
+                        job_id=job_id,
+                        stage_name=stage_name,
+                        provider="gemini",
+                        model_id=model_id,
+                        operation=operation,
+                        status_code=error.status_code,
+                        latency_ms=error.latency_ms or 0,
+                        input_bytes=input_bytes,
+                        request_id=error.request_id,
+                        error_code=error.code,
+                    )
                 )
-            )
+    except SQLAlchemyError as exc:
+        raise MediaProcessingError(
+            "provider_usage_write_failed",
+            "Provider usage could not be recorded.",
+            retryable=True,
+            transient=True,
+        ) from exc
 
 
 async def _run_media_preparation(context: JobContext) -> dict[str, Any]:
@@ -1101,6 +1264,7 @@ async def _run_visual_analysis(context: JobContext) -> dict[str, Any]:
     }
     provider: VisionProvider | None = None
     evidence: list[dict[str, Any]] = []
+    pending_evidence: list[dict[str, Any]] = []
     for frame in retained:
         frame_index = int(str(frame["frame_id"]))
         timestamp = float(frame["timestamp_seconds"])
@@ -1175,6 +1339,21 @@ async def _run_visual_analysis(context: JobContext) -> dict[str, Any]:
                     "duplicate_of": None,
                 },
             }
+        )
+        pending_evidence.append(evidence[-1])
+        if len(pending_evidence) >= settings.embedding_batch_size:
+            await _index_evidence_items(
+                context,
+                ChunkType.VISUAL,
+                pending_evidence,
+            )
+            pending_evidence.clear()
+
+    if pending_evidence:
+        await _index_evidence_items(
+            context,
+            ChunkType.VISUAL,
+            pending_evidence,
         )
 
     for duplicate_index, source_index in duplicates.items():
@@ -1278,16 +1457,46 @@ async def _run_visual_branch(context: JobContext) -> None:
     )
     output_path = analysis_checkpoint.get("output_path")
     expected_output = context.work_dir / "visual" / "visual-evidence.json"
-    if (
+    reset_analysis_stage = (
         not isinstance(output_path, str)
         or Path(output_path) != expected_output
         or not expected_output.is_file()
-    ):
+    )
+    if not reset_analysis_stage:
+        try:
+            cached_evidence = await _read_json(expected_output)
+            reset_analysis_stage = not isinstance(
+                cached_evidence.get("evidence"),
+                list,
+            )
+        except MediaProcessingError:
+            reset_analysis_stage = True
+    if reset_analysis_stage:
         await _reset_stage(context.job_id, "visual_analysis")
     await _run_branch_stage(
         context,
         "visual_analysis",
         lambda: _run_visual_analysis(context),
+    )
+    try:
+        evidence_payload = await _read_json(expected_output)
+    except MediaProcessingError as error:
+        raise BranchProcessingError("visual_analysis", error) from error
+    evidence = evidence_payload.get("evidence")
+    if not isinstance(evidence, list):
+        raise BranchProcessingError(
+            "indexing",
+            MediaProcessingError(
+                "visual_evidence_invalid",
+                "The saved visual evidence artifact is incomplete.",
+                retryable=False,
+            ),
+        )
+    await _index_evidence_items(
+        context,
+        ChunkType.VISUAL,
+        evidence,
+        prune=True,
     )
 
 
@@ -1311,6 +1520,28 @@ class BranchProcessingError(Exception):
         super().__init__(error.user_message)
         self.stage_name = stage_name
         self.error = error
+
+
+async def _index_evidence_items(
+    context: JobContext,
+    chunk_type: ChunkType,
+    evidence: list[dict[str, Any]],
+    *,
+    prune: bool = False,
+) -> None:
+    try:
+        await index_evidence(
+            context.job_id,
+            context.video_id,
+            chunk_type,
+            evidence,
+        )
+        if prune:
+            await prune_stale_evidence(context.video_id, chunk_type, evidence)
+    except ProviderError as error:
+        raise BranchProcessingError("embeddings", error) from error
+    except MediaProcessingError as error:
+        raise BranchProcessingError("indexing", error) from error
 
 
 async def _run_branch_stage(
@@ -1445,12 +1676,41 @@ async def _run_audio_branch(context: JobContext) -> None:
 
     chunk_checkpoint = await _stage_checkpoint(context.job_id, "transcript_chunking")
     chunk_path = chunk_checkpoint.get("output_path")
-    if not isinstance(chunk_path, str) or not Path(chunk_path).is_file():
+    reset_chunk_stage = not isinstance(chunk_path, str) or not Path(chunk_path).is_file()
+    if not reset_chunk_stage:
+        try:
+            cached_chunks = await _read_json(Path(chunk_path))
+            reset_chunk_stage = not isinstance(cached_chunks.get("chunks"), list)
+        except MediaProcessingError:
+            reset_chunk_stage = True
+    if reset_chunk_stage:
         await _reset_stage(context.job_id, "transcript_chunking")
     await _run_branch_stage(
         context,
         "transcript_chunking",
         lambda: _chunk_transcript(context),
+    )
+    try:
+        chunk_payload = await _read_json(
+            context.work_dir / "audio" / "transcript-chunks.json"
+        )
+    except MediaProcessingError as error:
+        raise BranchProcessingError("transcript_chunking", error) from error
+    chunks = chunk_payload.get("chunks")
+    if not isinstance(chunks, list):
+        raise BranchProcessingError(
+            "transcript_chunking",
+            MediaProcessingError(
+                "transcript_artifact_invalid",
+                "The saved transcript chunks are incomplete.",
+                retryable=False,
+            ),
+        )
+    await _index_evidence_items(
+        context,
+        ChunkType.TRANSCRIPT,
+        chunks,
+        prune=True,
     )
 
 
@@ -1582,6 +1842,25 @@ async def _record_branch_failures(
                     "user_message": failure.error.user_message,
                     "retryable": failure.error.retryable,
                 }
+            fallback_error = failures[0].error
+            active_stages = (
+                await session.scalars(
+                    select(ProcessingStage)
+                    .where(
+                        ProcessingStage.job_id == job_id,
+                        ProcessingStage.status == StageStatus.RUNNING,
+                    )
+                    .with_for_update()
+                )
+            ).all()
+            for stage in active_stages:
+                stage.status = StageStatus.FAILED
+                stage.finished_at = now
+                stage.last_error = {
+                    "code": fallback_error.code,
+                    "user_message": fallback_error.user_message,
+                    "retryable": fallback_error.retryable,
+                }
 
 
 async def process_ingestion_job(job_id: UUID, retry_count: int = 0) -> None:
@@ -1617,6 +1896,8 @@ async def process_ingestion_job(job_id: UUID, retry_count: int = 0) -> None:
             if await _is_cancelled(job_id):
                 return
 
+            await _start_stage(job_id, "embeddings")
+            await _start_stage(job_id, "indexing")
             results = await asyncio.gather(
                 _run_audio_branch(context),
                 _run_visual_branch(context),
@@ -1655,7 +1936,40 @@ async def process_ingestion_job(job_id: UUID, retry_count: int = 0) -> None:
                 return
             if await _is_cancelled(job_id):
                 return
-            await _finish_pipeline_at_phase_boundary(job_id)
+            settings = get_settings()
+            await _complete_stage(
+                job_id,
+                "embeddings",
+                {
+                    "model_id": settings.embedding_model_id,
+                    "model_version": settings.embedding_model_version,
+                    "dimension": settings.embedding_dimension,
+                },
+            )
+            await _complete_stage(
+                job_id,
+                "indexing",
+                {"database": "postgresql", "vector_store": "pgvector"},
+            )
+            try:
+                await _set_lifecycle_status(job_id, LifecycleStatus.INDEXING)
+            except MediaProcessingError as error:
+                raise BranchProcessingError("indexing", error) from error
+            try:
+                await _set_lifecycle_status(job_id, LifecycleStatus.VERIFYING)
+            except MediaProcessingError as error:
+                raise BranchProcessingError("verification", error) from error
+            await _run_branch_stage(
+                context,
+                "verification",
+                lambda: _verify_index_artifacts(context),
+            )
+            if await _is_cancelled(job_id):
+                return
+            try:
+                await _mark_job_ready(job_id)
+            except MediaProcessingError as error:
+                raise BranchProcessingError("verification", error) from error
         except BranchProcessingError as exc:
             await _handle_retryable_error(
                 job_id,

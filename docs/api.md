@@ -53,16 +53,34 @@ Request:
 ```
 
 This records a versioned, per-asset acknowledgement that audio/video-derived
-content—including audio, transcript text, selected frames, and OCR—may be sent
-to the configured external AI provider. The frontend discloses that Gemini's
-unpaid tier may use submitted content to improve Google products and may be
-human-reviewed. Do not upload sensitive, confidential, or personal content.
+content—including audio, transcript text, selected frames, OCR, questions, and
+retrieved evidence—may be sent to the configured external AI provider. The
+frontend discloses that Gemini's unpaid tier may use submitted content and
+generated answers to improve Google products and may be human-reviewed. Do not
+upload sensitive, confidential, or personal content.
 Google's terms also require an 18+ operator and professional or business use;
 consumer-use applications and applications directed to minors are not eligible.
-Provider calls remain unavailable until an API key, no-active-billing project,
-unpaid-data acknowledgement, and terms acknowledgement are configured locally.
+Unpaid Gemini use is unavailable for API clients made available to users in
+the EEA, UK, or Switzerland. Provider calls remain unavailable until an API
+key, no-active-billing project, unpaid-data acknowledgement, terms
+acknowledgement, and operator confirmation of eligible region are configured
+locally. The region setting is an operator assertion, not automatic
+geolocation. The project does not permit paid use.
 The consent version is updated when the disclosed data types or provider terms
 change; older assets must be explicitly re-consented before processing resumes.
+
+## Video library and detail
+
+`GET /api/v1/videos?limit=50&offset=0` returns the local library ordered by
+recent update. `limit` is between 1 and 100; `offset` is nonnegative.
+
+`GET /api/v1/videos/{asset_id}` returns the asset metadata, current processing
+status and stage progress, plus whether the current external-processing consent
+version is recorded.
+
+`GET /api/v1/videos/{asset_id}/media` streams the stored MP4 with HTTP byte
+range support so the browser player can seek. The API resolves the path from
+the application-owned asset UUID and does not return local filesystem paths.
 
 ## Upload video bytes
 
@@ -140,11 +158,9 @@ Invalid lifecycle transitions return a structured HTTP 409 error.
 The worker inspects audio timeline metadata with FFprobe, extracts mono 16 kHz
 FLAC using FFmpeg, segments below the verified 30-minute word-timestamp limit,
 and sends segments to Gemini 3.5 Transcribe only when both consent gates are
-satisfied. Each segment retains its original-video offset. Transcripts and
-timestamped chunks are written to local work artifacts and checkpoints; they
-are not yet inserted into the shared pgvector/FTS index. Consequently, the job
-remains `PROCESSING` and is not marked `READY` until the later visual and shared
-indexing phases are implemented.
+satisfied. Each segment retains its original-video offset. Timestamped
+transcript chunks are checkpointed locally and sent to shared indexing after
+chunking.
 
 The provider uses the official Interactions API and Files API with
 `store: false`, requests verbatim word timestamps, and deletes temporary
@@ -166,11 +182,85 @@ existing `PAUSED_QUOTA` workflow.
 
 Scene, frame, OCR, and description results are checkpointed per asset on local
 storage and in `processing_stages`. Audio and visual failures are isolated;
-successful artifacts from the other branch are retained. The API still reports
-the job as `PROCESSING` after both evidence branches complete because shared
-embedding, FTS indexing, and verification are not implemented yet. No asset is
-marked `READY` at this phase boundary.
+successful artifacts and any indexed chunks from the other branch are retained.
 
-Asset/library listing, video detail, question/answer, and shared indexing are
-not implemented yet. YouTube audiovisual downloading is not enabled; do not
-use a downloader unless a compliant authorized acquisition route is approved.
+## Phase 6 shared indexing and readiness
+
+Transcript and visual evidence use one normalization and upsert service. The
+worker batches text embeddings through the verified `gemini-embedding-001`
+adapter, stores vectors with an explicit active index-version foreign key, and
+relies on PostgreSQL's search-vector trigger for FTS. A process-shared
+PostgreSQL advisory lock serializes embedding requests across workers; a
+configurable local minimum interval paces requests without claiming a provider
+quota. Already indexed, unchanged evidence is skipped on retry, and obsolete
+source references are removed only after that modality's complete evidence
+batch is indexed.
+
+The worker marks embeddings/indexing stages complete only after both required
+branches finish, then verifies expected chunk references, active model version,
+vector dimensions, and nonempty FTS vectors. Only after verification and all
+required stages succeed does the lifecycle become `READY`. A 429 pauses the
+job with its retry information and never triggers paid fallback. The adapter
+configuration defaults to 768 dimensions; changing the active model or
+dimension is rejected until an explicit re-embedding migration is implemented.
+
+## Phase 7 video-scoped hybrid search
+
+`POST /api/v1/videos/{asset_id}/search` accepts:
+
+```json
+{"query": "Where are Redis consumer groups explained?", "limit": 10}
+```
+
+The route requires a READY asset and current external-processing consent. It
+embeds the query using the active index version, then runs exact pgvector cosine
+search and PostgreSQL `plainto_tsquery`/`ts_rank_cd` search concurrently,
+restricted to that video's chunks and index version. Results are fused with
+deterministic Reciprocal Rank Fusion (RRF); duplicate chunks from the two
+retrieval channels are merged by chunk ID. The response includes citation IDs,
+modality, original-timeline bounds, source reference, channel ranks, and RRF
+score. Local filesystem paths and raw provider details are not returned.
+
+The server assembles a context capped at 12,000 characters, preserving
+speaker-transcript versus visual/OCR evidence labels. The character cap is
+conservatively below Gemini 3.8 Flash's documented 1,048,576-token input limit;
+it is not a tokenizer-derived token count. Query embedding uses the same
+provider request lock and local pacing as ingestion; a 429 returns a
+structured retryable search error but does not alter the already-ready asset
+or trigger ingestion.
+
+## Evidence-grounded answer
+
+`POST /api/v1/videos/{asset_id}/answer`
+
+Request:
+
+```json
+{"question": "What does the speaker say about consumer groups?", "limit": 10}
+```
+
+The route requires a READY asset and current external-processing consent. It
+embeds the question, performs the same video-scoped vector/FTS/RRF retrieval,
+and sends only the retrieved context and question to the verified generation
+adapter. It never re-ingests the video. The adapter uses
+`gemini-3.8-flash` through the stateless Interactions API (`store: false`) and
+structured JSON output. The service rejects citations that were not present in
+the supplied evidence, and abstains when no evidence is retrieved, the model
+abstains, or it provides no citations.
+
+Successful responses contain `answer`, `abstained`, `inference`, and a
+`citations` list. Each citation includes a stable evidence ID, `chunk_type`
+(`TRANSCRIPT` or `VISUAL`), original-timeline start/end times, and evidence
+text. The UI displays
+separate speaker-transcript and visible-frame/OCR citations; timestamp buttons
+seek the player to the citation's original-video start time. Answers and
+questions are not persisted by the API; provider usage metadata is recorded
+without storing question text. Google may still process unpaid-service inputs
+and outputs under its current terms.
+
+Provider quota exhaustion returns a structured HTTP 429 and never falls back
+to a paid model. Missing keys or invalid terms/region acknowledgements block
+live provider calls; no live call is made by unit or integration tests.
+
+YouTube audiovisual downloading is not enabled; do not use a downloader unless
+a compliant authorized acquisition route is approved.
