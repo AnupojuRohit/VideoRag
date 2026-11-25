@@ -1,0 +1,66 @@
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, Header, Query, Request
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.errors import APIError
+from app.db.session import get_db
+from app.schemas.videos import PreflightRequest, PreflightResponse, UploadResponse
+from app.services.deduplication.service import action_for_status, find_asset_by_hash
+from app.services.ingestion.uploads import save_video_upload
+
+router = APIRouter(prefix="/videos", tags=["videos"])
+
+
+@router.post("/preflight", response_model=PreflightResponse)
+async def upload_preflight(
+    payload: PreflightRequest,
+    session: Annotated[AsyncSession, Depends(get_db)],
+) -> PreflightResponse:
+    asset, job = await find_asset_by_hash(session, payload.sha256_hash)
+    if asset is None:
+        return PreflightResponse(can_upload=True, duplicate_action="upload")
+
+    action = action_for_status(asset.status)
+    return PreflightResponse(
+        can_upload=False,
+        duplicate_action=action,
+        asset_id=asset.id,
+        job_id=job.id if job else None,
+        status=asset.status,
+        retry_available=action == "retry_available",
+    )
+
+
+@router.post("/upload", response_model=UploadResponse)
+async def upload_video(
+    request: Request,
+    session: Annotated[AsyncSession, Depends(get_db)],
+    filename: Annotated[str, Query(min_length=1, max_length=255)],
+    x_content_sha256: Annotated[str, Header()],
+    content_type: Annotated[str | None, Header()] = None,
+) -> UploadResponse:
+    asset, job, duplicate, action = await save_video_upload(
+        request=request,
+        session=session,
+        filename=filename,
+        declared_mime_type=content_type,
+        client_sha256=x_content_sha256,
+    )
+    if job is None:
+        raise APIError(
+            500,
+            "processing_job_missing",
+            "The canonical video has no processing job.",
+        )
+    return UploadResponse(
+        asset_id=asset.id,
+        job_id=job.id,
+        sha256_hash=asset.sha256_hash,
+        original_filename=asset.original_filename,
+        file_size_bytes=asset.file_size_bytes,
+        duration_seconds=asset.duration_seconds,
+        status=asset.status,
+        duplicate=duplicate,
+        duplicate_action=action,
+    )
