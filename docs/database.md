@@ -4,14 +4,19 @@ PostgreSQL is the durable source of truth. Alembic enables pgvector first, then
 creates the application schema. Large original media is stored on local disk,
 never in database blobs.
 
-## Phase 1 tables
+## Core tables
 
 - `video_assets`: UUID identity, unique lowercase SHA-256, local path, validated
-  media metadata, lifecycle status, pipeline version, and audit timestamps.
+  media metadata and audio start offset, per-asset external-processing consent,
+  lifecycle status, pipeline version, and audit timestamps.
 - `processing_jobs`: asset foreign key, lifecycle/current stage, retry count,
-  JSON checkpoint/error, and a per-asset idempotency key.
+  JSON checkpoint/error, heartbeat, dispatch timestamp, lease, quota cooldown,
+  and a per-asset idempotency key.
 - `processing_stages`: independently checkpointable named stages, unique per
   job, with retry/error/timestamp fields.
+- `provider_usage_events`: provider/model operation, status, latency, request
+  ID, input bytes, and stable error code. It does not store transcripts,
+  credentials, or request payloads.
 - `video_chunks`: modality, text, original-timeline bounds, source reference,
   JSON metadata, pgvector embedding, index-version foreign key, and
   PostgreSQL `tsvector`.
@@ -23,6 +28,15 @@ Enums constrain asset/job lifecycle and stage/chunk types. Checks cover SHA-256
 shape, positive sizes/durations, nonnegative attempts, and ordered timestamps.
 Partial unique indexes limit each asset to one active job and each database to
 one active embedding index version.
+
+The worker holds a PostgreSQL advisory lock while processing a job. A short
+lease plus heartbeat lets the periodic Celery Beat reconciler safely republish
+abandoned work after a worker/container restart. Redis stores no durable job
+state and the Celery result backend is disabled.
+
+Audio artifacts and transcripts are checkpointed under
+`data/work/<asset_id>/audio/` on local storage. Until shared indexing is
+implemented, these artifacts are not searchable and the asset is not READY.
 
 ## Index consistency
 

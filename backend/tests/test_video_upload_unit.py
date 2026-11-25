@@ -71,6 +71,17 @@ def test_embedding_settings_require_model_version_and_dimension_together() -> No
     assert settings.embedding_dimension == 3
 
 
+def test_gemini_key_requires_unpaid_tier_data_acknowledgement() -> None:
+    with pytest.raises(ValidationError):
+        Settings(gemini_api_key="test-only-key")
+
+    settings = Settings(
+        gemini_api_key="test-only-key",
+        gemini_unpaid_api_acknowledged=True,
+    )
+    assert settings.gemini_api_key is not None
+
+
 def test_pipeline_stage_names_are_unique() -> None:
     assert len(PIPELINE_STAGES) == len(set(PIPELINE_STAGES))
     assert {"media_validation", "audio_extraction", "visual_analysis"} <= set(

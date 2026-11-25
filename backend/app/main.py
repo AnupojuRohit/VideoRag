@@ -16,6 +16,7 @@ from app.core.errors import APIError
 from app.core.logging_config import configure_logging
 from app.db.session import engine
 from app.api.routes.videos import router as videos_router
+from app.api.routes.jobs import router as jobs_router
 
 settings = get_settings()
 configure_logging(settings.log_level)
@@ -36,6 +37,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.include_router(videos_router, prefix="/api/v1")
+app.include_router(jobs_router, prefix="/api/v1")
 
 
 @app.exception_handler(APIError)

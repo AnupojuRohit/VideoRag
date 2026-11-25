@@ -7,6 +7,7 @@ import re
 import shutil
 import unicodedata
 from pathlib import Path, PurePosixPath
+from datetime import datetime, timezone
 from uuid import uuid4
 
 import aiofiles
@@ -16,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
 from app.core.errors import APIError
+from app.core.privacy import EXTERNAL_PROCESSING_CONSENT_VERSION
 from app.models.enums import (
     LifecycleStatus,
     PIPELINE_STAGES,
@@ -98,12 +100,19 @@ async def save_video_upload(
     filename: str,
     declared_mime_type: str | None,
     client_sha256: str,
+    external_processing_consent: bool,
 ) -> tuple[VideoAsset, ProcessingJob | None, bool, str]:
     if not _SHA256_RE.fullmatch(client_sha256):
         raise APIError(
             422,
             "invalid_sha256",
             "X-Content-SHA256 must contain a 64-character hexadecimal digest.",
+        )
+    if not external_processing_consent:
+        raise APIError(
+            422,
+            "external_processing_consent_required",
+            "Accept the external AI processing terms before uploading a video.",
         )
 
     safe_filename = sanitize_filename(filename)
@@ -177,9 +186,13 @@ async def save_video_upload(
             mime_type="video/mp4",
             video_codec=media_info.video_codec,
             audio_codec=media_info.audio_codec,
+            audio_start_time=media_info.audio_start_time,
             width=media_info.width,
             height=media_info.height,
             frame_rate=media_info.frame_rate,
+            external_processing_consent=True,
+            external_processing_consent_at=datetime.now(timezone.utc),
+            external_processing_consent_version=EXTERNAL_PROCESSING_CONSENT_VERSION,
             status=LifecycleStatus.UPLOADED,
         )
         job = ProcessingJob(
@@ -200,7 +213,13 @@ async def save_video_upload(
                     StageStatus.COMPLETED
                     if name == "media_validation"
                     else audio_stage_status
-                    if name in {"audio_extraction", "transcription", "transcript_chunking"}
+                    if name
+                    in {
+                        "audio_extraction",
+                        "audio_segmentation",
+                        "transcription",
+                        "transcript_chunking",
+                    }
                     else StageStatus.PENDING
                 ),
             )

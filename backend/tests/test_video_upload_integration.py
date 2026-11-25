@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import json
 import os
 import shutil
 import subprocess
@@ -17,12 +18,21 @@ from app.core.config import Settings
 from app.db.session import SessionLocal, engine
 from app.models.processing_job import ProcessingJob
 from app.models.processing_stage import ProcessingStage
+from app.models.provider_usage_event import ProviderUsageEvent
 from app.models.embedding_index_version import EmbeddingIndexVersion
 from app.models.enums import ChunkType
 from app.models.video_asset import VideoAsset
 from app.models.video_chunk import VideoChunk
 from app.services import media
+from app.services.ingestion import pipeline
 from app.services.ingestion import uploads
+from app.services.jobs import dispatch
+from app.services.media import audio
+from app.providers.transcription import (
+    ProviderUsage,
+    TranscribedWord,
+    TranscriptionResult,
+)
 
 pytestmark = [
     pytest.mark.integration,
@@ -64,6 +74,9 @@ def temporary_media_root(tmp_path: Path, monkeypatch) -> Path:
     settings = Settings(media_root=tmp_path)
     monkeypatch.setattr(uploads, "get_settings", lambda: settings)
     monkeypatch.setattr(media.ffprobe, "get_settings", lambda: settings)
+    monkeypatch.setattr(audio, "get_settings", lambda: settings)
+    monkeypatch.setattr(pipeline, "get_settings", lambda: settings)
+    monkeypatch.setattr(dispatch.celery_app, "send_task", lambda *args, **kwargs: None)
     return tmp_path
 
 
@@ -109,6 +122,7 @@ def _upload_headers(body: bytes) -> dict[str, str]:
     return {
         "Content-Type": "video/mp4",
         "X-Content-SHA256": hashlib.sha256(body).hexdigest(),
+        "X-External-Processing-Consent": "true",
     }
 
 
@@ -142,7 +156,7 @@ async def test_upload_and_different_filename_reuse_same_asset(
         assert first.status_code == 200, first.text
         first_body = first.json()
         tracked_assets.append(UUID(first_body["asset_id"]))
-        assert first_body["status"] == "UPLOADED"
+        assert first_body["status"] == "QUEUED"
         assert first_body["duplicate"] is False
 
         second = await client.post(
@@ -155,14 +169,14 @@ async def test_upload_and_different_filename_reuse_same_asset(
         assert second_body["asset_id"] == first_body["asset_id"]
         assert second_body["job_id"] == first_body["job_id"]
         assert second_body["duplicate"] is True
-        assert second_body["duplicate_action"] == "reuse_uploaded"
+        assert second_body["duplicate_action"] == "attach_existing_job"
 
         existing = await client.post(
             "/api/v1/videos/preflight",
             json={"sha256_hash": digest},
         )
         assert existing.json()["asset_id"] == first_body["asset_id"]
-        assert existing.json()["duplicate_action"] == "reuse_uploaded"
+        assert existing.json()["duplicate_action"] == "attach_existing_job"
 
     async with SessionLocal() as session:
         job_count = await session.scalar(
@@ -178,7 +192,7 @@ async def test_upload_and_different_filename_reuse_same_asset(
         asset = await session.get(VideoAsset, tracked_assets[0])
 
     assert job_count == 1
-    assert stage_count == 12
+    assert stage_count == 13
     assert asset is not None
     assert Path(asset.original_path).is_file()
     assert Path(asset.original_path).read_bytes() == valid_mp4_bytes
@@ -233,6 +247,7 @@ async def test_hash_mismatch_is_rejected_without_persisting_asset(
             headers={
                 "Content-Type": "video/mp4",
                 "X-Content-SHA256": wrong_hash,
+                "X-External-Processing-Consent": "true",
             },
         )
 
@@ -377,3 +392,99 @@ async def test_database_maintains_fts_and_rejects_wrong_embedding_dimension(
         with pytest.raises(IntegrityError):
             await session.flush()
         await session.rollback()
+
+
+@pytest.mark.asyncio
+async def test_audio_pipeline_persists_timestamped_local_chunks(
+    valid_mp4_bytes: bytes,
+    temporary_media_root: Path,
+    tracked_assets: list[UUID],
+    monkeypatch,
+) -> None:
+    class FakeTranscriptionProvider:
+        async def transcribe(self, audio_path: Path, mime_type: str) -> TranscriptionResult:
+            assert audio_path.is_file()
+            assert mime_type == "audio/flac"
+            return TranscriptionResult(
+                text="Hello world",
+                words=[
+                    TranscribedWord("Hello", 0.1, 0.4),
+                    TranscribedWord("world.", 0.5, 0.8),
+                ],
+                usage=ProviderUsage(
+                    provider="test",
+                    model_id="test-transcriber",
+                    operation="transcription",
+                    status_code=200,
+                    latency_ms=1,
+                    input_bytes=10,
+                    request_id="test-request",
+                ),
+            )
+
+    monkeypatch.setattr(
+        pipeline,
+        "create_transcription_provider",
+        FakeTranscriptionProvider,
+    )
+    async with await _client() as client:
+        response = await client.post(
+            "/api/v1/videos/upload?filename=audio-pipeline.mp4",
+            content=valid_mp4_bytes,
+            headers=_upload_headers(valid_mp4_bytes),
+        )
+    assert response.status_code == 200, response.text
+    upload = response.json()
+    asset_id = UUID(upload["asset_id"])
+    job_id = UUID(upload["job_id"])
+    tracked_assets.append(asset_id)
+
+    async with SessionLocal() as session:
+        asset = await session.get(VideoAsset, asset_id)
+        assert asset is not None
+        asset.duration_seconds = 10
+        asset.audio_start_time = 2
+        await session.commit()
+
+    await pipeline.process_ingestion_job(job_id)
+
+    async with SessionLocal() as session:
+        job = await session.get(ProcessingJob, job_id)
+        assert job is not None
+        stages = {
+            stage.name: stage.status
+            for stage in (
+                await session.scalars(
+                    select(ProcessingStage).where(
+                        ProcessingStage.job_id == job_id
+                    )
+                )
+            ).all()
+        }
+        asset = await session.get(VideoAsset, asset_id)
+        usage_count = await session.scalar(
+            select(func.count(ProviderUsageEvent.id)).where(
+                ProviderUsageEvent.job_id == job_id
+            )
+        )
+
+    assert job.status.value == "PROCESSING"
+    assert job.current_stage is None
+    assert job.lease_expires_at is None
+    assert asset is not None and asset.status.value == "PROCESSING"
+    assert stages["audio_extraction"].value == "COMPLETED"
+    assert stages["audio_segmentation"].value == "COMPLETED"
+    assert stages["transcription"].value == "COMPLETED"
+    assert stages["transcript_chunking"].value == "COMPLETED"
+    assert usage_count == 1
+    chunks_path = (
+        temporary_media_root
+        / "work"
+        / str(asset_id)
+        / "audio"
+        / "transcript-chunks.json"
+    )
+    transcript_chunks = json.loads(chunks_path.read_text(encoding="utf-8"))
+    assert transcript_chunks["timeline"] == "original_video"
+    assert transcript_chunks["chunks"][0]["start_time"] == 2.1
+    assert transcript_chunks["chunks"][0]["end_time"] == 2.8

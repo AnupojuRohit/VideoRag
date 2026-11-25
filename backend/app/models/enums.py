@@ -20,6 +20,7 @@ class StageStatus(str, Enum):
     SKIPPED = "SKIPPED"
     PAUSED_QUOTA = "PAUSED_QUOTA"
     FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
 
 
 class ChunkType(str, Enum):
@@ -31,6 +32,7 @@ PIPELINE_STAGES = (
     "media_validation",
     "media_preparation",
     "audio_extraction",
+    "audio_segmentation",
     "transcription",
     "transcript_chunking",
     "scene_detection",

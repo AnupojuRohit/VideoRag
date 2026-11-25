@@ -542,16 +542,17 @@ Create files incrementally as each phase is implemented; do not generate a huge 
 | Phase | Scope | Exit criteria |
 | --- | --- | --- |
 | 0 | Foundation: repo, Docker Compose, env, frontend/backend skeleton, PostgreSQL/pgvector, Redis, health checks, logging, tests | One command launches the stack; frontend opens; backend connects to DB |
-| 1 | Upload + SHA-256: validation, local storage, browser preflight, server verification, unique constraint | Re-uploading exact bytes reuses the existing asset |
-| 2 | Background jobs: Celery, states, retries, checkpoints, bounded concurrency | Jobs recover safely after restart |
-| 3 | Audio pipeline: FFmpeg, segmentation, online transcription, timestamps, transcript chunks | Searchable timestamped transcript is produced |
-| 4 | Visual pipeline: scene detection, frame sampling, dedup, OCR, online vision | Searchable timestamped visual evidence is produced |
-| 5 | Shared indexing: normalization, online embeddings, batching, pgvector, FTS | Both modalities are indexed and verified |
-| 6 | Hybrid retrieval: vector search, keyword search, RRF | Relevant evidence is retrieved for test questions |
-| 7 | Grounded Q&A: context assembly, generation, evidence, abstention | Answers cite supported evidence and timestamps |
-| 8 | Complete UI: library, player, chat, progress, errors | End-to-end user flow works |
-| 9 | Evaluation: ingestion, retrieval, timestamp, latency benchmarks | Metrics are measured and documented |
-| 10 | Hardening: security, recovery, resource limits, docs, failure tests | Common failures are handled and documented |
+| 1 | Durable schema and migrations: assets, jobs, stages, chunks, indexes | Schema matches the lifecycle and enforces durable constraints |
+| 2 | Upload + SHA-256: validation, local storage, browser preflight, server verification, unique constraint | Re-uploading exact bytes reuses the existing asset |
+| 3 | Durable job orchestration: Celery dispatch, PostgreSQL reconciliation, leases, retries, quota pause, status/control APIs | Jobs recover safely after restart without treating Redis as durable state |
+| 4 | Media preparation and audio: FFmpeg, bounded segments, verified online transcription, original-timeline timestamps, transcript artifacts | Timestamped audio evidence is checkpointed locally; asset stays non-READY |
+| 5 | Visual pipeline: scene detection, frame sampling, dedup, OCR, online vision | Timestamped visual evidence is produced |
+| 6 | Shared indexing: normalization, online embeddings, batching, pgvector, FTS | Both modalities are indexed and verified |
+| 7 | Hybrid retrieval: vector search, keyword search, RRF | Relevant evidence is retrieved for test questions |
+| 8 | Grounded Q&A: context assembly, generation, evidence, abstention | Answers cite supported evidence and timestamps |
+| 9 | Complete UI: library, player, chat, progress, errors | End-to-end user flow works |
+| 10 | Evaluation: ingestion, retrieval, timestamp, latency benchmarks | Metrics are measured and documented |
+| 11 | Hardening: security, recovery, resource limits, docs, failure tests | Common failures are handled and documented |
 
 Earlier planning estimate: approximately 28–42 days at 3–4 focused hours/day for an interview-ready build; a narrower prototype may take 2–3 weeks. This is a planning estimate, not a commitment.
 

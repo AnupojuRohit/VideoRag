@@ -61,9 +61,21 @@ class VideoAsset(Base):
     mime_type: Mapped[str] = mapped_column(String(127), nullable=False)
     video_codec: Mapped[str] = mapped_column(String(64), nullable=False)
     audio_codec: Mapped[str | None] = mapped_column(String(64))
+    audio_start_time: Mapped[float | None] = mapped_column(Float)
     width: Mapped[int] = mapped_column(Integer, nullable=False)
     height: Mapped[int] = mapped_column(Integer, nullable=False)
     frame_rate: Mapped[float | None] = mapped_column(Float)
+    external_processing_consent: Mapped[bool] = mapped_column(
+        nullable=False,
+        default=False,
+        server_default=text("false"),
+    )
+    external_processing_consent_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+    )
+    external_processing_consent_version: Mapped[str | None] = mapped_column(
+        String(64),
+    )
     status: Mapped[LifecycleStatus] = mapped_column(
         _lifecycle_enum(),
         nullable=False,

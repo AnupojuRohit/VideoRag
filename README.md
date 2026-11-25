@@ -4,7 +4,9 @@ Local-first, multimodal video knowledge retrieval. The application is built as a
 modular monolith: Next.js + TypeScript, FastAPI, PostgreSQL/pgvector, Redis, and
 Celery. Phase 1 establishes the durable data model; Phase 2 validates and stores
 local MP4 uploads, with browser-side SHA-256 preflight and duplicate reuse.
-Transcription, visual processing, indexing, and Q&A are not enabled yet.
+Phases 3 and 4 add PostgreSQL-backed job recovery, worker progress controls,
+bounded FFmpeg audio preparation, and an opt-in free-tier transcription adapter.
+Visual processing, shared indexing, and Q&A are not enabled yet.
 
 ## Requirements
 
@@ -25,7 +27,14 @@ Transcription, visual processing, indexing, and Q&A are not enabled yet.
 
 3. Open <http://localhost:3000>. The API liveness endpoint is
    <http://localhost:8000/health>; readiness is <http://localhost:8000/ready>.
-   Alembic migrations run before the API and worker start.
+   Alembic migrations run before the API, worker, and Celery Beat scheduler start.
+
+Transcription is disabled until you configure `GEMINI_API_KEY` from a Gemini
+project with no active billing account and set
+`GEMINI_UNPAID_API_ACKNOWLEDGED=true` after reviewing the data terms. Users must
+also consent per asset in the upload UI. Google's unpaid tier may use submitted
+content to improve its products and may be human-reviewed; do not send
+sensitive, confidential, or personal content. Never add a paid fallback.
 
 Stop the stack with `Ctrl+C`, then run
 `docker compose -f infra/docker-compose.yml down`. Add `-v` only when you
@@ -53,10 +62,12 @@ or media files.
 ## Current milestone
 
 Phase 1 adds the core relational schema and migrations. Phase 2 adds hash
-preflight and validated local uploads. A new asset remains `UPLOADED` until
-Phase 3 implements real task dispatch; uploads are not yet transcribed,
-visually analyzed, indexed, or answerable. Provider integrations will be added
-only after their current official documentation and free-tier constraints are
-verified.
+preflight and validated local uploads. Phase 3 adds durable job dispatch,
+reconciliation, leases, status/progress, retry, quota pause, and cancellation.
+Phase 4 prepares audio and produces timestamped local transcript artifacts using
+the verified online Gemini transcription endpoint. The asset remains
+`PROCESSING` until visual processing and shared indexing are implemented; it
+must not appear `READY` or searchable yet. Real provider calls require local
+configuration and an explicit per-asset consent.
 
 See [the API contract](./docs/api.md) and [database notes](./docs/database.md).

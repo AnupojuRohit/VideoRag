@@ -18,6 +18,7 @@ class MediaInfo:
     duration_seconds: float
     video_codec: str
     audio_codec: str | None
+    audio_start_time: float | None
     width: int
     height: int
     frame_rate: float | None
@@ -48,7 +49,7 @@ async def inspect_mp4(path: Path) -> MediaInfo:
         "-max_alloc",
         "100000000",
         "-show_entries",
-        "format=format_name,duration:stream=codec_type,codec_name,width,height,avg_frame_rate",
+        "format=format_name,duration:stream=codec_type,codec_name,width,height,avg_frame_rate,start_time",
         "-of",
         "json",
         str(path),
@@ -142,6 +143,23 @@ async def inspect_mp4(path: Path) -> MediaInfo:
         )
 
     video = video_streams[0]
+    audio_start_time = 0.0
+    if audio_streams:
+        try:
+            parsed_audio_start = float(audio_streams[0].get("start_time", 0))
+        except (TypeError, ValueError) as exc:
+            raise APIError(
+                422,
+                "invalid_audio_timeline",
+                "The audio stream has invalid timeline metadata.",
+            ) from exc
+        if not math.isfinite(parsed_audio_start):
+            raise APIError(
+                422,
+                "invalid_audio_timeline",
+                "The audio stream has invalid timeline metadata.",
+            )
+        audio_start_time = max(0.0, parsed_audio_start)
     try:
         width = int(video["width"])
         height = int(video["height"])
@@ -162,6 +180,7 @@ async def inspect_mp4(path: Path) -> MediaInfo:
         duration_seconds=duration,
         video_codec="h264",
         audio_codec="aac" if audio_streams else None,
+        audio_start_time=audio_start_time if audio_streams else None,
         width=width,
         height=height,
         frame_rate=_frame_rate(video.get("avg_frame_rate")),

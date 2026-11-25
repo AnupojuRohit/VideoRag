@@ -35,6 +35,7 @@ class PreflightResponse(BaseModel):
     job_id: UUID | None = None
     status: LifecycleStatus | None = None
     retry_available: bool = False
+    external_processing_consent: bool = False
 
 
 class UploadResponse(BaseModel):

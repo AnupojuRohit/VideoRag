@@ -37,6 +37,12 @@ class ProcessingJob(Base):
         ),
         Index("ix_processing_jobs_status_created", "status", "created_at"),
         Index(
+            "ix_processing_jobs_recovery",
+            "status",
+            "last_enqueued_at",
+            "lease_expires_at",
+        ),
+        Index(
             "uq_processing_jobs_one_active_per_video",
             "video_id",
             unique=True,
@@ -81,6 +87,10 @@ class ProcessingJob(Base):
     )
     last_error: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_enqueued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    resume_after: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

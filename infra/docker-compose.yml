@@ -84,9 +84,42 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-videorag}:${POSTGRES_PASSWORD:-local-development-only}@postgres:5432/${POSTGRES_DB:-videorag}
       REDIS_URL: redis://redis:6379/0
-    command: ["celery", "-A", "app.celery_app:celery_app", "worker", "--loglevel=INFO"]
+    command:
+      [
+        "celery",
+        "-A",
+        "app.celery_app:celery_app",
+        "worker",
+        "--loglevel=INFO",
+        "--concurrency=${WORKER_CONCURRENCY:-2}",
+      ]
     volumes:
       - ../data:/app/data
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+  scheduler:
+    build:
+      context: ..
+      dockerfile: backend/Dockerfile
+    env_file:
+      - path: ../.env
+        required: false
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-videorag}:${POSTGRES_PASSWORD:-local-development-only}@postgres:5432/${POSTGRES_DB:-videorag}
+      REDIS_URL: redis://redis:6379/0
+    command:
+      [
+        "celery",
+        "-A",
+        "app.celery_app:celery_app",
+        "beat",
+        "--loglevel=INFO",
+        "--schedule=/tmp/celerybeat-schedule",
+      ]
     depends_on:
       migrate:
         condition: service_completed_successfully
