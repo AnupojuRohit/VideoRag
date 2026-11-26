@@ -1,18 +1,21 @@
 import json
+import logging
 from pathlib import Path
 
 import httpx
 import pytest
 
+from app.core.logging_config import JsonFormatter
 from app.providers.errors import TranscriptionProviderError
 from app.providers.gemini_transcription import (
     MODEL_ID,
     GeminiTranscriptionProvider,
+    _http_error,
 )
 
 
 @pytest.mark.asyncio
-async def test_gemini_transcription_uses_word_timestamps_and_deletes_file(
+async def test_gemini_transcription_uses_audio_uri_payload_and_deletes_file(
     tmp_path: Path,
 ) -> None:
     audio_path = tmp_path / "segment.flac"
@@ -38,12 +41,21 @@ async def test_gemini_transcription_uses_word_timestamps_and_deletes_file(
                     "file": {
                         "name": "files/test-id",
                         "uri": "https://generativelanguage.googleapis.com/files/test-id",
+                        "mimeType": "audio/flac",
                     }
                 },
             )
         if request.url.path == "/v1beta/interactions":
             payload = json.loads(await request.aread())
             assert payload["model"] == f"models/{MODEL_ID}"
+            assert payload["input"] == [
+                {
+                    "type": "audio",
+                    "uri": "https://generativelanguage.googleapis.com/files/test-id",
+                    "mime_type": "audio/flac",
+                }
+            ]
+            assert all(item.get("type") != "file" for item in payload["input"])
             assert payload["store"] is False
             assert payload["generation_config"]["transcription_config"]["mode"][
                 "timestamp_granularities"
@@ -128,6 +140,58 @@ async def test_gemini_quota_response_is_classified_for_safe_pause(
     assert error.value.status_code == 429
 
 
+def test_transcription_http_error_logs_only_sanitized_structured_fields(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    secret = "test-api-key-secret"
+    payload_sentinel = "uploaded-audio-payload-sentinel"
+    base64_sentinel = "A" * 160
+    response = httpx.Response(
+        400,
+        headers={"x-goog-request-id": "test-request-id"},
+        json={
+            "error": {
+                "code": 400,
+                "status": "INVALID_ARGUMENT",
+                "message": (
+                    f"Invalid request using {secret}; {base64_sentinel}; "
+                    f"{'x' * 1200}"
+                ),
+                "request_payload": payload_sentinel,
+                "authorization": secret,
+            }
+        },
+    )
+
+    with caplog.at_level(logging.WARNING):
+        error = _http_error(response, "transcription", secret)
+
+    assert error.code == "provider_request_rejected"
+    assert error.retryable is False
+    assert error.transient is False
+    record = next(
+        record
+        for record in caplog.records
+        if record.message == "Gemini transcription HTTP request failed"
+    )
+    assert record.operation == "transcription"
+    assert record.http_status == 400
+    assert record.request_id == "test-request-id"
+    assert record.google_error_code == 400
+    assert record.google_error_status == "INVALID_ARGUMENT"
+    assert "Invalid request" in record.google_error_message
+    formatted = JsonFormatter().format(record)
+    assert '"google_error_message"' in formatted
+    assert '"request_id": "test-request-id"' in formatted
+    assert secret not in formatted
+    assert payload_sentinel not in formatted
+    assert secret not in record.google_error_message
+    assert base64_sentinel not in record.google_error_message
+    assert payload_sentinel not in caplog.text
+    assert secret not in caplog.text
+    assert len(record.google_error_message) <= 1000
+
+
 @pytest.mark.asyncio
 async def test_gemini_temporary_file_is_deleted_when_transcription_fails(
     tmp_path: Path,
@@ -154,6 +218,7 @@ async def test_gemini_temporary_file_is_deleted_when_transcription_fails(
                     "file": {
                         "name": "files/test-id",
                         "uri": "https://generativelanguage.googleapis.com/files/test-id",
+                        "mimeType": "audio/flac",
                     }
                 },
             )

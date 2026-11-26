@@ -12,7 +12,11 @@ class JsonFormatter(logging.Formatter):
             "logger": record.name,
             "message": record.getMessage(),
         }
-        for field in ("dependency", "error_type"):
+        for field in (
+            "dependency", "error_type", "operation", "http_status",
+            "google_error_code", "google_error_status",
+            "google_error_message", "request_id",
+        ):
             value = getattr(record, field, None)
             if value is not None:
                 payload[field] = str(value)

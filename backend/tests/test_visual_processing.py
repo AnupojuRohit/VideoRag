@@ -1,17 +1,20 @@
 import asyncio
 import base64
 import json
+import logging
 from pathlib import Path
 
 import httpx
 import pytest
 from PIL import Image, ImageDraw
 
+from app.core.logging_config import JsonFormatter
 from app.providers.errors import VisionProviderError
 from app.providers.gemini_vision import (
     API_REVISION,
     MODEL_ID,
     GeminiVisionProvider,
+    _provider_error,
 )
 from app.services.media.audio import MediaProcessingError
 from app.services.media.scene_detection import DetectedScene
@@ -225,6 +228,63 @@ async def test_gemini_vision_classifies_quota_and_rejects_oversized_frame(
     assert error.value.quota is True
     assert error.value.retry_after is not None
     assert calls == 1
+
+
+def test_vision_http_error_logs_only_sanitized_structured_fields(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    secret = "test-api-key-secret"
+    ocr_sentinel = "private-ocr-content-sentinel"
+    payload_sentinel = "image-request-payload-sentinel"
+    base64_sentinel = "B" * 160
+    response = httpx.Response(
+        503,
+        headers={"x-goog-request-id": "vision-request-id"},
+        json={
+            "error": {
+                "code": 503,
+                "status": "UNAVAILABLE",
+                "message": (
+                    f"Provider diagnostic: {secret}, {ocr_sentinel}, "
+                    f"{base64_sentinel}, {'x' * 1200}"
+                ),
+                "request_payload": payload_sentinel,
+                "authorization": secret,
+            }
+        },
+    )
+
+    with caplog.at_level(logging.WARNING):
+        error = _provider_error(
+            response,
+            0.0,
+            api_key=secret,
+            sensitive_text=ocr_sentinel,
+        )
+
+    assert error.code == "provider_temporarily_unavailable"
+    assert error.transient is True
+    record = next(
+        record
+        for record in caplog.records
+        if record.message == "Gemini vision HTTP request failed"
+    )
+    assert record.operation == "vision"
+    assert record.http_status == 503
+    assert record.request_id == "vision-request-id"
+    assert record.google_error_code == 503
+    assert record.google_error_status == "UNAVAILABLE"
+    assert "Provider diagnostic" in record.google_error_message
+    formatted = JsonFormatter().format(record)
+    assert '"google_error_message"' in formatted
+    assert '"request_id": "vision-request-id"' in formatted
+    assert secret not in record.google_error_message
+    assert ocr_sentinel not in record.google_error_message
+    assert base64_sentinel not in record.google_error_message
+    assert payload_sentinel not in formatted
+    assert secret not in formatted
+    assert ocr_sentinel not in formatted
+    assert len(record.google_error_message) <= 1000
 
 
 @pytest.mark.asyncio

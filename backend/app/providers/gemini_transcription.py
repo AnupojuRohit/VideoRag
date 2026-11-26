@@ -26,6 +26,9 @@ API_ROOT = "https://generativelanguage.googleapis.com"
 _OFFSET_RE = re.compile(r"^(?P<seconds>\d+(?:\.\d+)?)s$")
 _FILE_NAME_RE = re.compile(r"^files/[A-Za-z0-9_-]+$")
 _CHUNK_SIZE = 1024 * 1024
+_BASE64_DATA_RE = re.compile(
+    r"(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{32,}={0,2}(?![A-Za-z0-9+/])"
+)
 
 
 def _retry_after(value: str | None) -> datetime | None:
@@ -102,11 +105,52 @@ def _parse_words(body: dict[str, Any]) -> tuple[str, list[TranscribedWord]]:
     return text, words
 
 
-def _http_error(response: httpx.Response, operation: str) -> TranscriptionProviderError:
+def _http_error(
+    response: httpx.Response,
+    operation: str,
+    api_key: str | None = None,
+) -> TranscriptionProviderError:
     status = response.status_code
     request_id = response.headers.get(
         "x-goog-request-id",
         response.headers.get("x-request-id"),
+    )
+    try:
+        body = response.json()
+    except (ValueError, UnicodeDecodeError):
+        body = None
+    google_error = body.get("error") if isinstance(body, dict) else None
+    if not isinstance(google_error, dict):
+        google_error = {}
+    error_code = google_error.get("code")
+    if isinstance(error_code, bool) or not isinstance(error_code, int):
+        error_code = None
+    error_status = google_error.get("status")
+    if not isinstance(error_status, str) or re.fullmatch(
+        r"[A-Z][A-Z0-9_]{0,63}",
+        error_status,
+    ) is None:
+        error_status = None
+    error_message = google_error.get("message")
+    if isinstance(error_message, str):
+        if api_key:
+            error_message = error_message.replace(api_key, "[REDACTED]")
+        error_message = _BASE64_DATA_RE.sub("[REDACTED]", error_message)[:1000]
+    else:
+        error_message = None
+    safe_request_id = request_id
+    if safe_request_id is not None and api_key:
+        safe_request_id = safe_request_id.replace(api_key, "[REDACTED]")
+    logger.warning(
+        "Gemini transcription HTTP request failed",
+        extra={
+            "operation": operation,
+            "http_status": status,
+            "request_id": safe_request_id,
+            "google_error_code": error_code,
+            "google_error_status": error_status,
+            "google_error_message": error_message,
+        },
     )
     if status == 429:
         return TranscriptionProviderError(
@@ -182,7 +226,7 @@ class GeminiTranscriptionProvider:
             json={"file": {"display_name": audio_path.name}},
         )
         if not response.is_success:
-            raise _http_error(response, "file_upload")
+            raise _http_error(response, "file_upload", self._api_key)
         upload_url = response.headers.get("X-Goog-Upload-URL")
         if not upload_url:
             raise TranscriptionProviderError(
@@ -224,7 +268,7 @@ class GeminiTranscriptionProvider:
             content=self._file_chunks(audio_path),
         )
         if not response.is_success:
-            raise _http_error(response, "file_upload")
+            raise _http_error(response, "file_upload", self._api_key)
         try:
             body = response.json()
         except json.JSONDecodeError as exc:
@@ -244,7 +288,13 @@ class GeminiTranscriptionProvider:
                 status_code=response.status_code,
             )
         file = body.get("file")
-        if not isinstance(file, dict) or not isinstance(file.get("uri"), str):
+        uploaded_mime_type = file.get("mimeType") if isinstance(file, dict) else None
+        if (
+            not isinstance(file, dict)
+            or not isinstance(file.get("uri"), str)
+            or not isinstance(uploaded_mime_type, str)
+            or not uploaded_mime_type.strip()
+        ):
             raise TranscriptionProviderError(
                 "provider_upload_protocol_error",
                 "The transcription provider returned an incomplete upload response.",
@@ -259,7 +309,11 @@ class GeminiTranscriptionProvider:
                 retryable=True,
                 status_code=response.status_code,
             )
-        return file
+        return {
+            "name": name,
+            "uri": file["uri"],
+            "mime_type": uploaded_mime_type,
+        }
 
     async def _delete_file(
         self,
@@ -316,8 +370,9 @@ class GeminiTranscriptionProvider:
                             "model": f"models/{MODEL_ID}",
                             "input": [
                                 {
-                                    "type": "file",
-                                    "file_uri": uploaded_file["uri"],
+                                    "type": "audio",
+                                    "uri": uploaded_file["uri"],
+                                    "mime_type": uploaded_file["mime_type"],
                                 }
                             ],
                             "generation_config": {
@@ -333,7 +388,11 @@ class GeminiTranscriptionProvider:
                     )
                     status_code = response.status_code
                     if not response.is_success:
-                        raise _http_error(response, "transcription")
+                        raise _http_error(
+                            response,
+                            "transcription",
+                            self._api_key,
+                        )
                     try:
                         body = response.json()
                         if not isinstance(body, dict):

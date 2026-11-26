@@ -1,6 +1,8 @@
 import base64
 import asyncio
 import json
+import logging
+import re
 import time
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
@@ -17,6 +19,10 @@ from app.providers.vision import VisionProvider, VisionResult
 MODEL_ID = "gemini-3.8-flash"
 API_URL = "https://generativelanguage.googleapis.com/v1beta/interactions"
 API_REVISION = "2026-05-20"
+logger = logging.getLogger(__name__)
+_BASE64_DATA_RE = re.compile(
+    r"(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{32,}={0,2}(?![A-Za-z0-9+/])"
+)
 
 
 def _retry_after(value: str | None) -> datetime | None:
@@ -38,6 +44,8 @@ def _retry_after(value: str | None) -> datetime | None:
 def _provider_error(
     response: httpx.Response,
     request_started: float,
+    api_key: str | None = None,
+    sensitive_text: str | None = None,
 ) -> VisionProviderError:
     status = response.status_code
     request_id = response.headers.get(
@@ -45,6 +53,45 @@ def _provider_error(
         response.headers.get("x-request-id"),
     )
     latency_ms = round((time.monotonic() - request_started) * 1000)
+    try:
+        body = response.json()
+    except (ValueError, UnicodeDecodeError):
+        body = None
+    google_error = body.get("error") if isinstance(body, dict) else None
+    if not isinstance(google_error, dict):
+        google_error = {}
+    error_code = google_error.get("code")
+    if isinstance(error_code, bool) or not isinstance(error_code, int):
+        error_code = None
+    error_status = google_error.get("status")
+    if not isinstance(error_status, str) or re.fullmatch(
+        r"[A-Z][A-Z0-9_]{0,63}",
+        error_status,
+    ) is None:
+        error_status = None
+    error_message = google_error.get("message")
+    if isinstance(error_message, str):
+        if api_key:
+            error_message = error_message.replace(api_key, "[REDACTED]")
+        if sensitive_text:
+            error_message = error_message.replace(sensitive_text, "[REDACTED]")
+        error_message = _BASE64_DATA_RE.sub("[REDACTED]", error_message)[:1000]
+    else:
+        error_message = None
+    safe_request_id = request_id
+    if safe_request_id is not None and api_key:
+        safe_request_id = safe_request_id.replace(api_key, "[REDACTED]")
+    logger.warning(
+        "Gemini vision HTTP request failed",
+        extra={
+            "operation": "vision",
+            "http_status": status,
+            "request_id": safe_request_id,
+            "google_error_code": error_code,
+            "google_error_status": error_status,
+            "google_error_message": error_message,
+        },
+    )
     if status == 429:
         return VisionProviderError(
             "provider_quota_exceeded",
@@ -204,7 +251,12 @@ class GeminiVisionProvider:
             ) from exc
 
         if not response.is_success:
-            raise _provider_error(response, started)
+            raise _provider_error(
+                response,
+                started,
+                self._api_key,
+                ocr_text[:12000],
+            )
         try:
             body: Any = response.json()
         except json.JSONDecodeError as exc:
